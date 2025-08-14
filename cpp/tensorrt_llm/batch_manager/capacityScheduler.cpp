@@ -261,16 +261,24 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
                 uniqTaskIds.insert(req->getLoraTaskId().value());
             }
         }
-        else if (req->isDisaggGenerationInitState())
-        {
-            pendingDisGenInitRequests.emplace_back(req);
-        }
         else
         {
-            pendingRequests.emplace_back(req);
+            if (!req->isDisaggGenerationInitState())
+            {
+                pendingRequests.emplace_back(req);
+            }
         }
     }
 
+    for (auto const& req : activeRequests)
+    {
+        if (req->isDisaggGenerationInitState())
+        {
+            pendingDisGenInitRequests.emplace_back(req);
+        }
+    }
+
+    bool hasPendingDisaggGenInitRequests = pendingDisGenInitRequests.size() > 0;
     // If StaticBatchScheduling == true check if we can add pending requests only when no requests are active.
     // Otherwise, add just check that we can add pending requests.
     if (!StaticBatchScheduling || scheduledRequests.size() == 0)
@@ -292,12 +300,18 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
                     continue;
                 }
 
-                if (scheduledRequests.size() >= static_cast<std::size_t>(mMaxNumRequests))
+                if (scheduledRequests.size() >= static_cast<std::size_t>(mMaxNumRequests)
+                    && !hasPendingDisaggGenInitRequests)
                 {
                     break;
                 }
                 else if (req->isContextInitState() || req->isDisaggGenerationInitState())
                 {
+                    if (req->isContextInitState()
+                        && scheduledRequests.size() >= static_cast<std::size_t>(mMaxNumRequests))
+                    {
+                        continue;
+                    }
                     bool enoughBlocks = reservedBlocks.enoughAvailableBlocks(*req);
                     bool enoughCrossBlocks
                         = reservedCrossBlocks ? reservedCrossBlocks->enoughAvailableBlocks(*req) : true;
