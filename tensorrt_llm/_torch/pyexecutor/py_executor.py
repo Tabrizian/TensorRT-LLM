@@ -780,12 +780,18 @@ class PyExecutor:
                         torch.cuda.nvtx.range_push(
                             "_handle_new_tokens_inter_pp")
                         # Receive tokens from previous pp rank (w.r.t model forward direction)
+                        print(
+                            f"Receiving tokens from previous pp rank {self.dist.prev_pp_rank} for microbatch {prev_microbatch_id}, current rank {self.dist.rank}"
+                        )
                         (
                             logits,
                             sample_state.host,
                         ) = self.dist.recv_object(
                             src=self.dist.prev_pp_rank,
                             tag=prev_microbatch_id,
+                        )
+                        print(
+                            f"Received tokens from previous pp rank {self.dist.prev_pp_rank} for microbatch {prev_microbatch_id}, current rank {self.dist.rank}"
                         )
                         if logits is not None:
                             logits_host = torch.from_numpy(logits)
@@ -807,6 +813,9 @@ class PyExecutor:
                                 and sample_state.host.log_probs is not None))
                         serialized_logits = sample_state.host.logits.numpy(
                         ) if needs_logits else None
+                        print(
+                            f"Sending tokens to next pp rank {self.dist.next_pp_rank} for microbatch {prev_microbatch_id}, current rank {self.dist.rank}"
+                        )
                         self.send_handles[
                             prev_microbatch_id] = self.dist.isend_object(
                                 (
@@ -815,6 +824,9 @@ class PyExecutor:
                                 ),
                                 dest=self.dist.next_pp_rank,
                                 tag=prev_microbatch_id)
+                        print(
+                            f"Sent tokens to next pp rank {self.dist.next_pp_rank} for microbatch {prev_microbatch_id}, current rank {self.dist.rank}"
+                        )
                     torch.cuda.nvtx.range_pop()
 
                 # Stage 3: Finalize previous batch that finished tokens communication
