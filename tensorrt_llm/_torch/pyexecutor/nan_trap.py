@@ -66,6 +66,21 @@ def _walk_floating_tensors(obj):
         return
 
 
+_NAN_TRAP_ENABLED = False
+
+
+def enable_nan_trap() -> None:
+    """Activate the NaN-TRAP — called after warmup completes so that
+    warmup-time NaN (masked by the framework) doesn't dominate the trap log.
+    """
+    global _NAN_TRAP_ENABLED
+    _NAN_TRAP_ENABLED = True
+    try:
+        logger.error("[NaN-TRAP] enabled post-warmup")
+    except Exception:
+        pass
+
+
 class NanTrap:
     def __init__(self, names: List[str], device: torch.device):
         self.names = names
@@ -80,8 +95,14 @@ class NanTrap:
         )
         names: List[str] = []
         modules = []
+        # The DSv4 compressor module is called for side-effect only; its return
+        # value (kv_comp) has uninitialized regions that look like NaN to the
+        # hook but never propagate downstream. Skip it to avoid false positives.
         for name, mod in model.named_modules():
             if name == "":
+                continue
+            _skip_compressor = name.endswith(".compressor") or ".compressor." in name
+            if _skip_compressor:
                 continue
             names.append(name)
             modules.append(mod)
@@ -111,6 +132,13 @@ class NanTrap:
 
     def check_and_log(self, rank: int) -> None:
         # Host-side; call OUTSIDE the captured region (once per model.forward).
+        if not _NAN_TRAP_ENABLED:
+            # Still clear flags so warmup-time triggers don't leak forward.
+            try:
+                self.flags.zero_()
+            except Exception:
+                pass
+            return
         self._step += 1
         try:
             flags_host = self.flags.to("cpu", non_blocking=False)

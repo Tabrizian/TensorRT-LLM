@@ -67,7 +67,7 @@ from .layerwise_nvtx_marker import LayerwiseNvtxMarker
 from .llm_request import LlmRequest, get_draft_token_length
 from .mamba_cache_manager import MambaHybridCacheManager
 from .model_loader import ModelLoader, _construct_checkpoint_loader
-from .nan_trap import maybe_create_nan_trap
+from .nan_trap import enable_nan_trap, maybe_create_nan_trap
 from .resource_manager import (BaseResourceManager, KVCacheManager,
                                KVCacheManagerV2, PeftCacheManager,
                                ResourceManager, ResourceManagerType)
@@ -286,7 +286,8 @@ class PyTorchModelEngine(ModelEngine):
             self.model_is_wrapped = True
         else:
             self.model_is_wrapped = False
-        # Optional NaN/Inf forward-hook trap (env TRTLLM_NAN_TRAP=1). CUDA-graph-safe.
+        # Optional NaN/Inf forward-hook trap (env TRTLLM_NAN_TRAP=1).
+        # CUDA-graph-safe; flag is flipped post-warmup so production NaN is what surfaces.
         self._nan_trap = maybe_create_nan_trap(self.model)
         self.sparse_attention_config = self.model.model_config.sparse_attention_config
         # In case that some tests use stub models and override `_load_model`.
@@ -851,6 +852,18 @@ class PyTorchModelEngine(ModelEngine):
                 resource_manager)
             self._general_warmup(resource_manager, warmup_requests_configs)
             log_mem_snapshot("warmup/after_memory_pool_prepop")
+
+        # DIAG: enable the AR device-assert (TRTLLM_AR_DEVICE_ASSERT=1) so it
+        # only fires during real production iterations, not warmup.
+        try:
+            from ..distributed.ops import enable_ar_device_assert
+            enable_ar_device_assert()
+        except Exception:
+            pass
+        try:
+            enable_nan_trap()
+        except Exception:
+            pass
 
     def _general_warmup(self, resource_manager: ResourceManager,
                         warmup_requests_configs: List[Tuple[int, int]]):
@@ -4132,6 +4145,11 @@ class PyTorchModelEngine(ModelEngine):
 
             if self._nan_trap is not None:
                 self._nan_trap.check_and_log(self.mapping.rank)
+            try:
+                from ..distributed.ops import ar_shape_trace_step_boundary
+                ar_shape_trace_step_boundary()
+            except Exception:
+                pass
 
             return outputs
 

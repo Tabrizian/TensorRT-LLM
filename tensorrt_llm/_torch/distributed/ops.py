@@ -21,6 +21,135 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 
+
+def _resolve_ar_module_path(target) -> str:
+    """Walk live objects to build a dotted path "outer.inner.allreduce" for
+    the given nn.Module. Best-effort; returns "<unresolved>" if not found.
+    Eager-mode only — do not call from CUDA graph capture.
+    """
+    import gc
+
+    import torch.nn as _nn
+
+    def find_parent(mod):
+        # Iterate all live nn.Module instances and check their _modules dict.
+        for obj in gc.get_objects():
+            try:
+                if isinstance(obj, _nn.Module) and obj is not mod:
+                    for k, v in obj._modules.items():
+                        if v is mod:
+                            return obj, k
+            except Exception:
+                continue
+        return None, None
+
+    parts = []
+    cur = target
+    seen = set()
+    for _ in range(32):  # safety bound
+        if id(cur) in seen:
+            break
+        seen.add(id(cur))
+        parent, local = find_parent(cur)
+        if parent is None or local is None:
+            break
+        parts.append(local)
+        cur = parent
+    return ".".join(reversed(parts)) if parts else "<unresolved>"
+
+
+# --- AR shape tracer state ---
+_AR_SHAPE_TRACE: list = []
+_AR_SHAPE_TRACE_STEP: int = 0
+_AR_SHAPE_TRACE_LAST_LEN: int = 0
+_AR_SHAPE_TRACE_DUMPED: bool = False
+
+
+def _add_ar_shape_trace_entry(rank: int, shape, dtype: str, fusion_op: int,
+                              strategy: int, module_id: int) -> None:
+    """Append a (step, rank, shape, dtype, fusion_op, strategy, module_id) row.
+    Caller already verified post-warmup + not-capturing.
+    Step boundaries are inferred externally by snapshotting the trace length
+    at known forward boundaries; we just append rows."""
+    if _AR_SHAPE_TRACE_DUMPED:
+        return
+    _AR_SHAPE_TRACE.append((
+        _AR_SHAPE_TRACE_STEP,
+        rank,
+        shape,
+        dtype,
+        fusion_op,
+        strategy,
+        module_id,
+    ))
+
+
+def ar_shape_trace_step_boundary() -> None:
+    """Called by model_engine.forward at the end of each forward step.
+    Increments the step counter; once configured-step-count reached, dumps
+    the trace to disk and sets _AR_SHAPE_TRACE_DUMPED=True so further calls
+    are no-op."""
+    global _AR_SHAPE_TRACE_STEP, _AR_SHAPE_TRACE_LAST_LEN, _AR_SHAPE_TRACE_DUMPED
+    if _AR_SHAPE_TRACE_DUMPED:
+        return
+    if os.environ.get("TRTLLM_AR_SHAPE_TRACE", "0") != "1":
+        return
+    new_len = len(_AR_SHAPE_TRACE)
+    if new_len == _AR_SHAPE_TRACE_LAST_LEN:
+        return  # no new entries in this forward; ignore
+    _AR_SHAPE_TRACE_STEP += 1
+    _AR_SHAPE_TRACE_LAST_LEN = new_len
+    target_steps = int(os.environ.get("TRTLLM_AR_SHAPE_TRACE_STEPS", "5"))
+    if _AR_SHAPE_TRACE_STEP >= target_steps:
+        _dump_ar_shape_trace()
+
+
+def _dump_ar_shape_trace() -> None:
+    global _AR_SHAPE_TRACE_DUMPED
+    if _AR_SHAPE_TRACE_DUMPED:
+        return
+    try:
+        out_dir = os.environ.get(
+            "TRTLLM_AR_SHAPE_TRACE_DIR",
+            "/lustre/fsw/coreai_comparch_trtllm/itabrizian/aa-results-root/ar_shape_trace",
+        )
+        os.makedirs(out_dir, exist_ok=True)
+        # One file per process pid to avoid cross-rank collisions; tp_rank
+        # is in each row.
+        path = f"{out_dir}/ar_shape_trace_pid{os.getpid()}.pt"
+        torch.save(
+            {
+                "entries": list(_AR_SHAPE_TRACE),
+                "n_steps": _AR_SHAPE_TRACE_STEP,
+                "n_entries": len(_AR_SHAPE_TRACE)
+            }, path)
+        logger.error(f"[AR-SHAPE-TRACE] dumped {len(_AR_SHAPE_TRACE)} entries "
+                     f"across {_AR_SHAPE_TRACE_STEP} steps to {path}")
+    except Exception as _e:
+        try:
+            logger.error(f"[AR-SHAPE-TRACE] dump failed: {_e}")
+        except Exception:
+            pass
+    _AR_SHAPE_TRACE_DUMPED = True
+
+
+# Flips True after model_engine.warmup() completes; the AR device-assert
+# is a no-op until then so warmup-time NaN can be masked normally and
+# production traffic actually starts.
+_AR_DEVICE_ASSERT_ENABLED = False
+
+
+def enable_ar_device_assert() -> None:
+    """Called by model_engine after warmup completes. Activates the AR
+    device-assert so subsequent production AR calls will trap NaN."""
+    global _AR_DEVICE_ASSERT_ENABLED
+    _AR_DEVICE_ASSERT_ENABLED = True
+    try:
+        logger.error("[AR-DEVASSERT] enabled post-warmup")
+    except Exception:
+        pass
+
+
 # Feature flag: GEMM→NCCL-window zero-copy (writes GEMM output directly into
 # the window buffer so the allreduce needs no extra copy).  Off by default
 # (0); set TLLM_NCCL_SYMMETRIC_ZERO_COPY=1 to enable.
@@ -920,6 +1049,170 @@ class AllReduce(nn.Module):
                 trigger_completion_at_end,
                 **additional_args,
             )
+
+        # DIAG: Shape tracer. Gated by TRTLLM_AR_SHAPE_TRACE=1. Records every
+        # AR call's (shape, dtype, fusion_op, strategy, instance_path) into a
+        # module-level list. Capture-safe: no .item() / no device ops; the post-
+        # warmup gate and the capture-state check ensure this only runs in
+        # eager production forwards. Dump to disk after a few iters via env
+        # TRTLLM_AR_SHAPE_TRACE_DUMP_AFTER (default 5) calls of dump_shape_trace().
+        if os.environ.get("TRTLLM_AR_SHAPE_TRACE", "0") == "1":
+            try:
+                _trace_capturing = torch.cuda.is_current_stream_capturing()
+            except Exception:
+                _trace_capturing = False
+            try:
+                from tensorrt_llm._torch.pyexecutor.nan_trap import \
+                    _NAN_TRAP_ENABLED as _strace_post_warmup
+            except Exception:
+                _strace_post_warmup = False
+            if not _trace_capturing and _strace_post_warmup:
+                _add_ar_shape_trace_entry(
+                    rank=self.mapping.tp_rank,
+                    shape=tuple(input.shape),
+                    dtype=str(input.dtype),
+                    fusion_op=int(all_reduce_params.fusion_op),
+                    strategy=int(allreduce_strategy),
+                    module_id=id(self),
+                )
+
+        # DIAG: AR NaN capture. Gated by TRTLLM_AR_NAN_DEBUG=1.
+        # Skip during CUDA graph capture — .item() syncs invalidate capture.
+        _capturing = False
+        try:
+            _capturing = torch.cuda.is_current_stream_capturing()
+        except Exception:
+            pass
+        # Gate on post-warmup so we capture real decode-iter inputs not warmup ones.
+        try:
+            from tensorrt_llm._torch.pyexecutor.nan_trap import \
+                _NAN_TRAP_ENABLED as _arnan_post_warmup
+        except Exception:
+            _arnan_post_warmup = False
+        if not _capturing and _arnan_post_warmup and os.environ.get(
+                "TRTLLM_AR_NAN_DEBUG", "0") == "1":
+            out_t = output if not isinstance(output,
+                                             (tuple, list)) else output[0]
+            if isinstance(out_t, torch.Tensor) and out_t.is_floating_point():
+                try:
+                    # Check input cleanness + output NaN with single sync.
+                    in_has_nan = bool((torch.isnan(input).any()
+                                       | torch.isinf(input).any()).item())
+                    out_has_nan = bool((torch.isnan(out_t).any()
+                                        | torch.isinf(out_t).any()).item())
+                    if out_has_nan and not in_has_nan and not getattr(
+                            self, "_ar_nan_dumped", False):
+                        import os as _ar_os
+                        dump_dir = _ar_os.environ.get(
+                            "TRTLLM_AR_DUMP_DIR",
+                            "/lustre/fsw/coreai_comparch_trtllm/itabrizian/aa-results-root/ar_capture",
+                        )
+                        _ar_os.makedirs(dump_dir, exist_ok=True)
+                        used_autotune = (allreduce_strategy
+                                         == AllReduceStrategy.AUTO
+                                         and not disable_allreduce_autotune
+                                         and not self._disable_mpi)
+                        payload = {
+                            "tp_size":
+                            self.mapping.tp_size,
+                            "tp_rank":
+                            self.mapping.tp_rank,
+                            "strategy_enum_value":
+                            int(allreduce_strategy),
+                            "strategy_name":
+                            str(allreduce_strategy),
+                            "fusion_op":
+                            int(all_reduce_params.fusion_op),
+                            "fusion_op_name":
+                            str(all_reduce_params.fusion_op),
+                            "eps":
+                            all_reduce_params.eps,
+                            "trigger_completion_at_end":
+                            all_reduce_params.trigger_completion_at_end,
+                            "used_autotune_path":
+                            used_autotune,
+                            "disable_allreduce_autotune":
+                            disable_allreduce_autotune,
+                            "input":
+                            input.detach().cpu().clone(),
+                            "input_shape":
+                            tuple(input.shape),
+                            "input_dtype":
+                            str(input.dtype),
+                            "output":
+                            out_t.detach().cpu().clone(),
+                            "residual":
+                            (all_reduce_params.residual.detach().cpu().clone()
+                             if all_reduce_params.residual is not None else
+                             None),
+                            "norm_weight":
+                            (all_reduce_params.norm_weight.detach().cpu().clone(
+                            ) if all_reduce_params.norm_weight is not None else
+                             None),
+                        }
+                        path = f"{dump_dir}/ar_dump_rank{self.mapping.tp_rank}_tp{self.mapping.tp_size}.pt"
+                        torch.save(payload, path)
+                        logger.error(
+                            f"[AR-NAN] rank={self.mapping.tp_rank} strategy={allreduce_strategy} "
+                            f"fusion_op={all_reduce_params.fusion_op} "
+                            f"used_autotune={used_autotune} shape={tuple(input.shape)} "
+                            f"dtype={input.dtype} → dumped to {path}")
+                        self._ar_nan_dumped = True
+                except (NotImplementedError, RuntimeError):
+                    pass
+
+        # DIAG: Device-side NaN/Inf check. Gated by TRTLLM_AR_DEVICE_ASSERT=1.
+        # Capture-safe: torch._assert_async queues an assert kernel; no host sync.
+        # When NaN/Inf appears, the assert fires on the device and surfaces at the
+        # next host->device sync as `_assert_async_cuda_kernel ... Assertion`.
+        if _AR_DEVICE_ASSERT_ENABLED and os.environ.get(
+                "TRTLLM_AR_DEVICE_ASSERT", "0") == "1":
+            _out_da = output if not isinstance(output,
+                                               (tuple, list)) else output[0]
+            if isinstance(_out_da,
+                          torch.Tensor) and _out_da.is_floating_point():
+                # Resolve & log this AR instance's dotted path once, in eager mode.
+                # Done here (post-AR-call) on first invocation so all model state
+                # is in place; runs outside any CUDA graph capture region because
+                # graph capture only happens during warmup *after* the model is
+                # fully constructed and at least one eager forward has run.
+                if not getattr(self, "_ar_name_resolved", False):
+                    try:
+                        _path = _resolve_ar_module_path(self)
+                    except Exception:
+                        _path = "<resolve-error>"
+                    self._ar_name = _path
+                    self._ar_name_resolved = True
+                    if not torch.cuda.is_current_stream_capturing():
+                        logger.error(f"[AR-NAME] rank={self.mapping.tp_rank} "
+                                     f"module_id={id(self)} path={_path}")
+                # Origination filter: only assert when inputs were finite
+                # but output is NaN/Inf. Avoids blaming an AR that merely
+                # propagates NaN from upstream.
+                _out_finite = torch.isfinite(_out_da).all()
+                _clean_inputs = torch.isfinite(input).all()
+                if all_reduce_params is not None:
+                    if (all_reduce_params.residual is not None and isinstance(
+                            all_reduce_params.residual, torch.Tensor)
+                            and all_reduce_params.residual.is_floating_point()):
+                        _clean_inputs = _clean_inputs & torch.isfinite(
+                            all_reduce_params.residual).all()
+                    if (all_reduce_params.norm_weight is not None
+                            and isinstance(all_reduce_params.norm_weight,
+                                           torch.Tensor) and
+                            all_reduce_params.norm_weight.is_floating_point()):
+                        _clean_inputs = _clean_inputs & torch.isfinite(
+                            all_reduce_params.norm_weight).all()
+                # Origination = clean_inputs implies finite_output
+                #              = (NOT clean_inputs) OR finite_output
+                _ok = (~_clean_inputs) | _out_finite
+                _msg = (
+                    f"[AR-DEVASSERT-ORIG] rank={self.mapping.tp_rank} "
+                    f"tp_size={self.mapping.tp_size} module_id={id(self)} "
+                    f"path={getattr(self, '_ar_name', '<unknown>')}: "
+                    f"clean inputs but non-finite output -- AR originated NaN/Inf"
+                )
+                torch._assert_async(_ok, _msg)
 
         return output if len(output) > 1 else output[0]
 
