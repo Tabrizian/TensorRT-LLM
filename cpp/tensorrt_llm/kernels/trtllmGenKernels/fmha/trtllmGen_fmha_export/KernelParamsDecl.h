@@ -108,6 +108,10 @@ struct KernelParams {
   // The variable sparseMla topK lengths with shape of [numTokensQ]
   //  where each tokenQ has a corresponding topK length.
   int32_t const* ptrSparseMlaTopKLens;
+  // DSv4 inverse-RoPE + FP8 quant fusion metadata and output scale tensor.
+  int32_t const* ptrDsv4InvRopePositionIds;
+  float const* ptrDsv4InvRopeCosSinCache;
+  float* ptrDsv4OScaleFp32;
 
   // The attention window size for sliding window attention.
   int32_t mAttentionWindowSize;
@@ -154,6 +158,13 @@ struct KernelParams {
   int32_t mReshapeFactorKv;
   // The output scale for FP8 quantization.
   float mOutputScale;
+  // Runtime layout for DSv4 inverse-RoPE + FP8 quant fused output.
+  int32_t mDsv4HeadsPerGroup;
+  int32_t mDsv4ScaleBufM;
+  int64_t mDsv4Fp8StrideGroup;
+  int64_t mDsv4Fp8StrideToken;
+  int64_t mDsv4ScaleStrideGroup;
+  int64_t mDsv4ScaleStrideK;
   // The scaling factor for softmax (multiplied by log2 to use faster exp2).
   float mScaleSoftmaxLog2;
   // The SF scale for Kv.

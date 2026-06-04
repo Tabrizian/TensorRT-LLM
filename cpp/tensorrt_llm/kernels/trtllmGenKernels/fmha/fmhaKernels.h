@@ -215,8 +215,8 @@ public:
 
     static bool shouldUseNvrtc(FmhaOptions const& options)
     {
-        return options.mFmhaKernelType == FmhaKernelType::SwapsMmaAbForGeneration
-            && !isTokenSparse(options.mSparseType) && options.mDtypeKv != tg::Dtype::E2m1;
+        return options.mFmhaKernelType == FmhaKernelType::SwapsMmaAbForGeneration && !isTokenSparse(options.mSparseType)
+            && options.mDtypeKv != tg::Dtype::E2m1;
     }
 
     std::pair<bool, std::string> checkIfKernelExist(RunnerParams const& params) const
@@ -376,18 +376,19 @@ public:
                 fmhaData.mInputBuffers.qBasePtr, fmhaData.mInputBuffers.kBasePtr, fmhaData.mInputBuffers.vBasePtr,
                 fmhaData.mScales.kSfBasePtr, fmhaData.mScales.vSfBasePtr,
                 fmhaData.mInputBuffers.slidingWindowKvPoolBasePtr, fmhaData.mMetaData.kvPageIdxD,
-                fmhaData.mScales.outputScaleD, fmhaData.mScales.scaleSoftmaxLog2D, fmhaData.mScales.kvSfScaleD,
-                fmhaData.mScales.oSfScaleD, fmhaData.mInputBuffers.customMaskPtrD,
-                fmhaData.mInputBuffers.customMaskOffsetsPtrD, fmhaData.mMetaData.firstSparseMaskOffsetsKvPtrD,
-                fmhaData.mMetaData.sparseMlaTopKLensPtrD, fmhaData.mScales.sageAttnSfsQPtrD,
-                fmhaData.mScales.sageAttnSfsKPtrD, fmhaData.mScales.sageAttnSfsPPtrD, fmhaData.mScales.sageAttnSfsVPtrD,
-                fmhaData.mInputBuffers.attentionSinksPtrD, fmhaData.mOutputBuffers.oPtrD, fmhaData.mScales.oSfPtrD,
-                fmhaData.mOutputBuffers.multiCtasKvCounterPtrD, fmhaData.mOutputBuffers.partialOPtrD,
-                fmhaData.mOutputBuffers.partialStatsPtrD, fmhaData.mOutputBuffers.skipSoftmaxStatsPtrD,
-                fmhaData.mOutputBuffers.softmaxStatsD, fmhaData.mOutputBuffers.oDebugPtrD,
-                fmhaData.mScales.softmaxScale, fmhaData.mMetaData.inflateMax, fmhaData.mScales.kvSfScale,
-                fmhaData.mScales.oSfScale, fmhaData.mMetaData.startTokenIdxSfO, options.mUseBlockSparseAttention,
-                options.mUsesSharedPagedKvIdx);
+                fmhaData.mScales.outputScaleD, fmhaData.mScales.dsv4InvRopePositionIdsD,
+                fmhaData.mScales.dsv4InvRopeCosSinCacheD, fmhaData.mScales.dsv4OScaleFp32D,
+                fmhaData.mScales.scaleSoftmaxLog2D, fmhaData.mScales.kvSfScaleD, fmhaData.mScales.oSfScaleD,
+                fmhaData.mInputBuffers.customMaskPtrD, fmhaData.mInputBuffers.customMaskOffsetsPtrD,
+                fmhaData.mMetaData.firstSparseMaskOffsetsKvPtrD, fmhaData.mMetaData.sparseMlaTopKLensPtrD,
+                fmhaData.mScales.sageAttnSfsQPtrD, fmhaData.mScales.sageAttnSfsKPtrD, fmhaData.mScales.sageAttnSfsPPtrD,
+                fmhaData.mScales.sageAttnSfsVPtrD, fmhaData.mInputBuffers.attentionSinksPtrD,
+                fmhaData.mOutputBuffers.oPtrD, fmhaData.mScales.oSfPtrD, fmhaData.mOutputBuffers.multiCtasKvCounterPtrD,
+                fmhaData.mOutputBuffers.partialOPtrD, fmhaData.mOutputBuffers.partialStatsPtrD,
+                fmhaData.mOutputBuffers.skipSoftmaxStatsPtrD, fmhaData.mOutputBuffers.softmaxStatsD,
+                fmhaData.mOutputBuffers.oDebugPtrD, fmhaData.mScales.softmaxScale, fmhaData.mMetaData.inflateMax,
+                fmhaData.mScales.kvSfScale, fmhaData.mScales.oSfScale, fmhaData.mMetaData.startTokenIdxSfO,
+                options.mUseBlockSparseAttention, options.mUsesSharedPagedKvIdx);
 
             launchFmhaKernel(kernelParams, kernelMeta, func, grid, options, params.stream);
             // Run the separate reduction kernel if needed.
@@ -398,7 +399,8 @@ public:
 private:
     inline uint64_t hashID(int qkvLayout, int maskType, int kernelType, int scheduler, int multiCtasKvMode,
         int headDimPerCtaV, int headDimQk, int headDimV, int tileSizeQ, int tileSizeKv, int numTokensPerPage,
-        bool reuseSmemKForV, bool uses2CtaMma, int sparseAttention, bool skipsSoftmax) const
+        bool reuseSmemKForV, bool uses2CtaMma, int sparseAttention, bool skipsSoftmax, bool fusesDsv4InvRopeFp8Quant,
+        bool dsv4InvRopeIsNeox) const
     {
         TLLM_CHECK_WITH_INFO((headDimPerCtaV >= 32) && (headDimQk >= 32) && (headDimV >= 32) && (headDimPerCtaV <= 1024)
                 && (headDimQk <= 1024) && (headDimV <= 1024),
@@ -428,6 +430,8 @@ private:
         // Bit 54 - 54: uses2CtaMma.
         // Bit 55 - 56: sparseAttention.
         // Bit 57 - 57: skipsSoftmax.
+        // Bit 58 - 58: fusesDsv4InvRopeFp8Quant.
+        // Bit 59 - 59: dsv4InvRopeIsNeox.
         return (static_cast<uint64_t>(qkvLayout) << 0) | (static_cast<uint64_t>(maskType) << 4)
             | (static_cast<uint64_t>(kernelType) << 8) | (static_cast<uint64_t>(scheduler) << 12)
             | (static_cast<uint64_t>(multiCtasKvMode) << 16) | (static_cast<uint64_t>(headDimPerCtaV >> 3) << 18)
@@ -436,7 +440,8 @@ private:
             | (static_cast<uint64_t>(numTokensPerPage > 0 ? static_cast<int>(log2(numTokensPerPage)) : 0) << 44)
             | (static_cast<uint64_t>(log2(tileSizeQ)) << 49) | (static_cast<uint64_t>(reuseSmemKForV) << 53)
             | (static_cast<uint64_t>(uses2CtaMma) << 54) | (static_cast<uint64_t>(sparseAttention) << 55)
-            | (static_cast<uint64_t>(skipsSoftmax) << 57);
+            | (static_cast<uint64_t>(skipsSoftmax) << 57) | (static_cast<uint64_t>(fusesDsv4InvRopeFp8Quant) << 58)
+            | (static_cast<uint64_t>(dsv4InvRopeIsNeox) << 59);
     }
 
     uint64_t hashID(KernelMeta const& kernelMeta) const
@@ -444,7 +449,8 @@ private:
         return hashID(kernelMeta.mQkvLayout, kernelMeta.mMaskType, kernelMeta.mKernelType, kernelMeta.mTileScheduler,
             kernelMeta.mMultiCtasKvMode, kernelMeta.mHeadDimPerCtaV, kernelMeta.mHeadDimQk, kernelMeta.mHeadDimV,
             kernelMeta.mTileSizeQ, kernelMeta.mTileSizeKv, kernelMeta.mNumTokensPerPage, kernelMeta.mReuseSmemKForV,
-            kernelMeta.m2CtaMma, kernelMeta.mSparseAttn, kernelMeta.mSkipsSoftmaxWhenPossible);
+            kernelMeta.m2CtaMma, kernelMeta.mSparseAttn, kernelMeta.mSkipsSoftmaxWhenPossible,
+            kernelMeta.mFusesDsv4InvRopeFp8Quant, kernelMeta.mDsv4InvRopeIsNeox);
     }
 
     std::pair<uint64_t, std::string> hashFromFmhaOptions(FmhaOptions const& options) const
@@ -472,7 +478,9 @@ private:
             + std::to_string(options.mNumTokensPerPage) + ", reuseSmemKForV=" + std::to_string(options.mReuseSmemKForV)
             + ", uses2CtaMma=" + std::to_string(uses2CtaMma)
             + ", sparseType=" + std::to_string(static_cast<int>(options.mSparseType))
-            + ", skipsSoftmax=" + std::to_string(options.mSkipsSoftmaxWhenPossible);
+            + ", skipsSoftmax=" + std::to_string(options.mSkipsSoftmaxWhenPossible)
+            + ", fusesDsv4InvRopeFp8Quant=" + std::to_string(options.mFusesDsv4InvRopeFp8Quant)
+            + ", dsv4InvRopeIsNeox=" + std::to_string(options.mDsv4InvRopeIsNeox);
 
         TLLM_LOG_DEBUG("Searching for kernel traits: " + info);
         return std::make_pair(hashID(static_cast<int>(options.mQkvLayout), static_cast<int>(options.mMaskType),
@@ -481,7 +489,8 @@ private:
                                   static_cast<int>(options.mHeadDimQk), static_cast<int>(options.mHeadDimV),
                                   static_cast<int>(options.mTileSizeQ), static_cast<int>(options.mTileSizeKv),
                                   static_cast<int>(options.mNumTokensPerPage), options.mReuseSmemKForV, uses2CtaMma,
-                                  static_cast<int>(options.mSparseType), options.mSkipsSoftmaxWhenPossible),
+                                  static_cast<int>(options.mSparseType), options.mSkipsSoftmaxWhenPossible,
+                                  options.mFusesDsv4InvRopeFp8Quant, options.mDsv4InvRopeIsNeox),
             info);
     }
 
@@ -676,6 +685,17 @@ private:
         fmhaData.mScales.outputScaleD = params.outputScalePtr;
         fmhaData.mScales.kvSfScaleD = params.kvSfScalePtr;
         fmhaData.mScales.oSfScaleD = params.oSfScalePtr;
+        if (params.mDsv4EpilogueFusion.enabled)
+        {
+            TLLM_CHECK_WITH_INFO(
+                params.mDsv4EpilogueFusion.positionIds != nullptr, "DSv4 fused epilogue requires position ids.");
+            TLLM_CHECK_WITH_INFO(params.mDsv4EpilogueFusion.cosSinCache != nullptr,
+                "DSv4 fused epilogue requires a RoPE cos/sin cache.");
+            TLLM_CHECK_WITH_INFO(params.oSfPtr != nullptr, "DSv4 fused epilogue requires FP32 output scale buffer.");
+            fmhaData.mScales.dsv4InvRopePositionIdsD = params.mDsv4EpilogueFusion.positionIds;
+            fmhaData.mScales.dsv4InvRopeCosSinCacheD = params.mDsv4EpilogueFusion.cosSinCache;
+            fmhaData.mScales.dsv4OScaleFp32D = static_cast<float*>(params.oSfPtr);
+        }
         // Sage Attention scaling factors
         fmhaData.mScales.sageAttnSfsQPtrD = params.sageAttnSfsQPtr;
         fmhaData.mScales.sageAttnSfsKPtrD = params.sageAttnSfsKPtr;
@@ -816,6 +836,18 @@ private:
         if (options.mQkvLayout != QkvLayout::PackedQkv)
         {
             options.mSupportsDiffSeqLensForQAndKv = true;
+        }
+        if (params.mDsv4EpilogueFusion.enabled)
+        {
+            options.mFusesDsv4InvRopeFp8Quant = true;
+            options.mDsv4InvRopeIsNeox = params.mDsv4EpilogueFusion.isNeox;
+            options.mDtypeOut = tg::Dtype::E4m3;
+            options.mDsv4HeadsPerGroup = params.mDsv4EpilogueFusion.headsPerGroup;
+            options.mDsv4ScaleBufM = params.mDsv4EpilogueFusion.scaleBufM;
+            options.mDsv4Fp8StrideGroup = params.mDsv4EpilogueFusion.fp8StrideGroup;
+            options.mDsv4Fp8StrideToken = params.mDsv4EpilogueFusion.fp8StrideToken;
+            options.mDsv4ScaleStrideGroup = params.mDsv4EpilogueFusion.scaleStrideGroup;
+            options.mDsv4ScaleStrideK = params.mDsv4EpilogueFusion.scaleStrideK;
         }
 
         // Enables the optimization to skip the correction step when possible.
@@ -992,7 +1024,9 @@ private:
             + ", reuseSmemKForV=" + std::to_string(selectKernelParams.mReuseSmemKForV)
             + ", uses2CtaMma=" + std::to_string(selectKernelParams.mUses2CtaMma)
             + ", sparseAttention=" + std::to_string(static_cast<int>(params.mSparseAttention))
-            + ", skipsSoftmax=" + std::to_string(selectKernelParams.mSkipsSoftmaxWhenPossible);
+            + ", skipsSoftmax=" + std::to_string(selectKernelParams.mSkipsSoftmaxWhenPossible)
+            + ", fusesDsv4InvRopeFp8Quant=" + std::to_string(params.mDsv4EpilogueFusion.enabled)
+            + ", dsv4InvRopeIsNeox=" + std::to_string(params.mDsv4EpilogueFusion.isNeox);
 
         TLLM_LOG_DEBUG("Searching for kernel traits: " + info);
 
@@ -1003,7 +1037,8 @@ private:
                 params.mHeadDimQk, params.mHeadDimV, selectKernelParams.mTileSizeQ, selectKernelParams.mTileSizeKv,
                 selectKernelParams.mNumTokensPerPage, selectKernelParams.mReuseSmemKForV,
                 selectKernelParams.mUses2CtaMma, static_cast<int>(params.mSparseAttention),
-                selectKernelParams.mSkipsSoftmaxWhenPossible),
+                selectKernelParams.mSkipsSoftmaxWhenPossible, params.mDsv4EpilogueFusion.enabled,
+                params.mDsv4EpilogueFusion.isNeox),
             info);
     }
 
@@ -1071,7 +1106,8 @@ public:
 
     KernelType* getKernels(const typename KernelType::KernelMeta* pKernelList, unsigned int nbKernels, Data_type dtypeQ,
         Data_type dtypeK, Data_type dtypeV, Data_type dtypeOut, unsigned int sm, int numEltsPerSageAttnBlkQ = 0,
-        int numEltsPerSageAttnBlkK = 0, int numEltsPerSageAttnBlkP = 0, int numEltsPerSageAttnBlkV = 0)
+        int numEltsPerSageAttnBlkK = 0, int numEltsPerSageAttnBlkP = 0, int numEltsPerSageAttnBlkV = 0,
+        bool fusesDsv4InvRopeFp8Quant = false, bool dsv4InvRopeIsNeox = false)
     {
         static std::mutex s_mutex;
         std::lock_guard<std::mutex> lg(s_mutex);
@@ -1080,7 +1116,7 @@ public:
             "SageAttention allows numEltsPerSageAttnBlk up to 64.");
 
         auto const id = hashID(dtypeQ, dtypeK, dtypeV, dtypeOut, sm, numEltsPerSageAttnBlkQ, numEltsPerSageAttnBlkK,
-            numEltsPerSageAttnBlkP, numEltsPerSageAttnBlkV);
+            numEltsPerSageAttnBlkP, numEltsPerSageAttnBlkV, fusesDsv4InvRopeFp8Quant, dsv4InvRopeIsNeox);
         auto const findIter = mKernels.find(id);
         if (findIter == mKernels.end())
         {
@@ -1109,8 +1145,8 @@ private:
     TllmFmhaKernelFactory() = default;
 
     inline uint64_t hashID(Data_type dtypeQ, Data_type dtypeK, Data_type dtypeV, Data_type dtypeOut, unsigned int sm,
-        int numEltsPerSageAttnBlkQ, int numEltsPerSageAttnBlkK, int numEltsPerSageAttnBlkP,
-        int numEltsPerSageAttnBlkV) const
+        int numEltsPerSageAttnBlkQ, int numEltsPerSageAttnBlkK, int numEltsPerSageAttnBlkP, int numEltsPerSageAttnBlkV,
+        bool fusesDsv4InvRopeFp8Quant, bool dsv4InvRopeIsNeox) const
     {
         auto const computeLog2BlockSizePlus1 = [](int blockSize) -> int
         {
@@ -1131,12 +1167,16 @@ private:
         // Bit 35 - 37: log2NumEltsPerSageAttnBlkK + 1 -- 0 for non-sage, max numEltsPerSageAttnBlkK is 64.
         // Bit 38 - 40: log2NumEltsPerSageAttnBlkP + 1 -- 0 for non-sage, max numEltsPerSageAttnBlkP is 64.
         // Bit 41 - 43: log2NumEltsPerSageAttnBlkV + 1 -- 0 for non-sage, max numEltsPerSageAttnBlkV is 64.
+        // Bit 44 - 44: fusesDsv4InvRopeFp8Quant.
+        // Bit 45 - 45: dsv4InvRopeIsNeox.
         return static_cast<uint64_t>(sm) | static_cast<uint64_t>(dtypeQ) << 16 | static_cast<uint64_t>(dtypeK) << 20
             | static_cast<uint64_t>(dtypeV) << 24 | static_cast<uint64_t>(dtypeOut) << 28
             | (static_cast<uint64_t>(computeLog2BlockSizePlus1(numEltsPerSageAttnBlkQ)) << 32)
             | (static_cast<uint64_t>(computeLog2BlockSizePlus1(numEltsPerSageAttnBlkK)) << 35)
             | (static_cast<uint64_t>(computeLog2BlockSizePlus1(numEltsPerSageAttnBlkP)) << 38)
-            | (static_cast<uint64_t>(computeLog2BlockSizePlus1(numEltsPerSageAttnBlkV)) << 41);
+            | (static_cast<uint64_t>(computeLog2BlockSizePlus1(numEltsPerSageAttnBlkV)) << 41)
+            | (static_cast<uint64_t>(fusesDsv4InvRopeFp8Quant) << 44)
+            | (static_cast<uint64_t>(dsv4InvRopeIsNeox) << 45);
     }
 
     std::unordered_map<uint64_t, const std::unique_ptr<KernelType>> mKernels;
@@ -1144,13 +1184,14 @@ private:
 
 inline TllmGenFmhaKernel* getTllmFmhaKernels(Data_type dtypeQ, Data_type dtypeK, Data_type dtypeV, Data_type dtypeOut,
     unsigned int sm, int numEltsPerSageAttnBlkQ = 0, int numEltsPerSageAttnBlkK = 0, int numEltsPerSageAttnBlkP = 0,
-    int numEltsPerSageAttnBlkV = 0)
+    int numEltsPerSageAttnBlkV = 0, bool fusesDsv4InvRopeFp8Quant = false, bool dsv4InvRopeIsNeox = false)
 {
 
 #ifndef EXCLUDE_SM_100F
     return TllmFmhaKernelFactory::Get().getKernels(sTllmGenFmhaKernelMetaInfos,
         sizeof(sTllmGenFmhaKernelMetaInfos) / sizeof(sTllmGenFmhaKernelMetaInfos[0]), dtypeQ, dtypeK, dtypeV, dtypeOut,
-        sm, numEltsPerSageAttnBlkQ, numEltsPerSageAttnBlkK, numEltsPerSageAttnBlkP, numEltsPerSageAttnBlkV);
+        sm, numEltsPerSageAttnBlkQ, numEltsPerSageAttnBlkK, numEltsPerSageAttnBlkP, numEltsPerSageAttnBlkV,
+        fusesDsv4InvRopeFp8Quant, dsv4InvRopeIsNeox);
 #else
     return nullptr;
 #endif // EXCLUDE_SM_100F

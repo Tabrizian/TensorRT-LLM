@@ -82,6 +82,11 @@ struct FmhaData {
     // output scale for FP8 per tensor attention
     float const* outputScaleD;
 
+    // DSv4 inverse-RoPE + 1x128 FP8 quant fusion inputs/output scale tensor.
+    int32_t const* dsv4InvRopePositionIdsD{nullptr};
+    float const* dsv4InvRopeCosSinCacheD{nullptr};
+    float* dsv4OScaleFp32D{nullptr};
+
     // Sage Attn scaling factors for Q, K, P, V
     float const* sageAttnSfsQPtrD;
     float const* sageAttnSfsKPtrD;

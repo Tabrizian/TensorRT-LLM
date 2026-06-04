@@ -20,7 +20,9 @@
 #include <trtllm/gen/CudaArchDecl.h>
 #include <trtllm/gen/CudaRunner.h>
 #include <nlohmann/json.hpp>
+#include <algorithm>
 #include <cfloat>
+#include <cstdint>
 #include <string>
 
 namespace fmha {
@@ -97,6 +99,14 @@ struct FmhaOptions : public KernelConfigBase {
   int mMaxNumWavesForCtasKvMode{1};
   // The attention output scale.
   float mOutputScale{1.f};
+  // Runtime layout for DSv4 inverse-RoPE + FP8 quant fused output. These are only used when
+  // mFusesDsv4InvRopeFp8Quant is enabled.
+  int32_t mDsv4HeadsPerGroup{0};
+  int32_t mDsv4ScaleBufM{0};
+  int64_t mDsv4Fp8StrideGroup{0};
+  int64_t mDsv4Fp8StrideToken{0};
+  int64_t mDsv4ScaleStrideGroup{0};
+  int64_t mDsv4ScaleStrideK{0};
   // Relative error tolerance.
   float mRtol{1e-1f};
   // Whether to skip kernel generation (for debug purpose).
@@ -151,6 +161,12 @@ struct FmhaOptions : public KernelConfigBase {
     TO_JSON(mNumWarmUpSteps);
     TO_JSON(mMaxNumWavesForCtasKvMode);
     TO_JSON(mOutputScale);
+    TO_JSON(mDsv4HeadsPerGroup);
+    TO_JSON(mDsv4ScaleBufM);
+    TO_JSON(mDsv4Fp8StrideGroup);
+    TO_JSON(mDsv4Fp8StrideToken);
+    TO_JSON(mDsv4ScaleStrideGroup);
+    TO_JSON(mDsv4ScaleStrideK);
     TO_JSON(mRtol);
     TO_JSON(mSkipsKernelGen);
     TO_JSON(mSkipSoftmaxThresholdScaleFactor);
@@ -253,6 +269,32 @@ inline void checkFmhaOptions(FmhaOptions const& options,
     TLLM_CHECK_ERROR(options.mNumInstsQ == 1 && options.mNumInstsKv == 1,
                      "BF16Q+FP8KV full-transform kernels require numInstsQ == 1 and "
                      "numInstsKv == 1.");
+  }
+
+  if (options.mFusesDsv4InvRopeFp8Quant) {
+    TLLM_CHECK_ERROR(options.mIsMlaGen,
+                     "DSv4 inverse-RoPE FP8 quant fusion requires MLA generation.");
+    TLLM_CHECK_ERROR(options.mSparseType == SparseType::DynamicTokenSparse,
+                     "DSv4 inverse-RoPE FP8 quant fusion requires dynamic token sparse MLA.");
+    TLLM_CHECK_ERROR(options.mFuseEpilogueIntoCorr,
+                     "DSv4 inverse-RoPE FP8 quant fusion requires fused correction epilogue.");
+    TLLM_CHECK_ERROR(isKeepsMmaAbForGenerationKernel(options.mFmhaKernelType),
+                     "DSv4 inverse-RoPE FP8 quant fusion only supports keepsMmaAbForGeneration.");
+    TLLM_CHECK_ERROR(options.mQkvLayout == QkvLayout::PagedKv,
+                     "DSv4 inverse-RoPE FP8 quant fusion requires paged KV.");
+    TLLM_CHECK_ERROR(options.mDtypeQ == tg::Dtype::E4m3 && options.mDtypeK == tg::Dtype::E4m3 &&
+                       options.mDtypeV == tg::Dtype::E4m3,
+                     "DSv4 inverse-RoPE FP8 quant fusion requires dtypeQ/K/V=e4m3.");
+    TLLM_CHECK_ERROR(options.mDtypeOut == tg::Dtype::E4m3,
+                     "DSv4 inverse-RoPE FP8 quant fusion requires dtypeOut=e4m3.");
+    TLLM_CHECK_ERROR(options.mHeadDimQk == 512,
+                     "DSv4 inverse-RoPE FP8 quant fusion requires headDimQk=512.");
+    TLLM_CHECK_ERROR(options.mHeadDimV == 512,
+                     "DSv4 inverse-RoPE FP8 quant fusion requires headDimV=512.");
+    TLLM_CHECK_ERROR(options.mHeadDimPerCtaV == 256,
+                     "DSv4 inverse-RoPE FP8 quant fusion requires headDimPerCtaV=256.");
+    TLLM_CHECK_ERROR(options.mMultiCtasKvMode == MultiCtasKvMode::Disabled,
+                     "DSv4 inverse-RoPE FP8 quant fusion does not support multiCtasKvMode.");
   }
 
   // The number of instances for Q and Kv must be set together.
@@ -398,7 +440,7 @@ inline void checkFmhaOptions(FmhaOptions const& options,
   // Special options for block-scaled outputs.
   if (fmha::hasOutputSfs(options.mDtypeOut)) {
     TLLM_CHECK_ERROR(options.mFuseEpilogueIntoCorr,
-                      "E2m1 / MxE4m3 output only supports fuseEpilogueIntoCorr");
+                     "E2m1 / MxE4m3 output only supports fuseEpilogueIntoCorr");
 
     // Make sure the number of SFs per row can be divided by 4, required for interleaved SF layout.
     int32_t numEltsPerSfO = tg::dtypeNumEltsPerSf(options.mDtypeOut);
@@ -616,6 +658,35 @@ inline void updateFmhaOptions(FmhaOptions& options, FmhaOptionsFromArgs const& o
   // Enable variable sequence if minSeqLenQ < maxSeqLenQ or minSeqLenKv < maxSeqLenKv.
   options.mSupportsVarSeqLens |=
     (options.mMinSeqLenQ < options.mMaxSeqLenQ) || (options.mMinSeqLenKv < options.mMaxSeqLenKv);
+
+  if (options.mFusesDsv4InvRopeFp8Quant) {
+    if (options.mDsv4HeadsPerGroup == 0) {
+      options.mDsv4HeadsPerGroup = options.mNumHeadsQ;
+    }
+    TLLM_CHECK_ERROR(options.mDsv4HeadsPerGroup > 0 &&
+                       options.mNumHeadsQ % options.mDsv4HeadsPerGroup == 0,
+                     "mDsv4HeadsPerGroup must be positive and divide mNumHeadsQ.");
+    if (options.mDsv4ScaleBufM == 0) {
+      int64_t const maxPackedTokens =
+        std::max(int64_t{options.mSumOfSeqLensQ},
+                 int64_t{options.mBatchSize} * int64_t{options.mMaxSeqLenQ});
+      options.mDsv4ScaleBufM = int32_t((maxPackedTokens + 3) / 4 * 4);
+    }
+    if (options.mDsv4Fp8StrideToken == 0) {
+      options.mDsv4Fp8StrideToken = int64_t{options.mDsv4HeadsPerGroup} * options.mHeadDimV;
+    }
+    if (options.mDsv4Fp8StrideGroup == 0) {
+      options.mDsv4Fp8StrideGroup = int64_t{options.mDsv4ScaleBufM} * options.mDsv4Fp8StrideToken;
+    }
+    if (options.mDsv4ScaleStrideK == 0) {
+      options.mDsv4ScaleStrideK = options.mDsv4ScaleBufM;
+    }
+    if (options.mDsv4ScaleStrideGroup == 0) {
+      int32_t constexpr chunksPerHead = 4;
+      options.mDsv4ScaleStrideGroup =
+        int64_t{options.mDsv4HeadsPerGroup} * chunksPerHead * options.mDsv4ScaleStrideK;
+    }
+  }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

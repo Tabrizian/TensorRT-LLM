@@ -60,9 +60,10 @@ inline __device__ void convertFloatToMxE4m3(OutT& out,
   // MxE4m3 uses one UE8M0 scale for each group of 32 E4M3 elements.
   int32_t constexpr NumEltsPerSf = 32;
   int32_t constexpr NumThreadsPerVec = NumEltsPerSf / NumEltsPerThread;
-  static_assert(NumEltsPerSf % NumEltsPerThread == 0 &&
-                NumEltsPerThread % 4 == 0, "NumEltsPerThread not supported.");
-  static_assert(sizeof(OutT) == NumEltsPerThread, "Output type not supported."); // 1 byte per element.
+  static_assert(NumEltsPerSf % NumEltsPerThread == 0 && NumEltsPerThread % 4 == 0,
+                "NumEltsPerThread not supported.");
+  static_assert(sizeof(OutT) == NumEltsPerThread,
+                "Output type not supported."); // 1 byte per element.
 
   float localAmax = 0.f;
 #pragma unroll
@@ -92,17 +93,18 @@ inline __device__ void convertFloatToMxE4m3(OutT& out,
 
 template <int32_t NumEltsPerThread, typename OutT>
 inline __device__ void convertFp16ToMxE4m3(OutT& out,
-                                            cutlass::float_ue8m0_t& sfOut,
-                                            cutlass::half_t const (&in)[NumEltsPerThread],
-                                            float sfScale) {
+                                           cutlass::float_ue8m0_t& sfOut,
+                                           cutlass::half_t const (&in)[NumEltsPerThread],
+                                           float sfScale) {
   // MxE4m3 uses one UE8M0 scale for each group of 32 E4M3 elements.
   int32_t constexpr NumEltsPerSf = 32;
   int32_t constexpr NumThreadsPerVec = NumEltsPerSf / NumEltsPerThread;
-  static_assert(NumEltsPerSf % NumEltsPerThread == 0 &&
-                NumEltsPerThread % 4 == 0, "NumEltsPerThread not supported.");
-  static_assert(sizeof(OutT) == NumEltsPerThread, "Output type not supported."); // 1 byte per element.
+  static_assert(NumEltsPerSf % NumEltsPerThread == 0 && NumEltsPerThread % 4 == 0,
+                "NumEltsPerThread not supported.");
+  static_assert(sizeof(OutT) == NumEltsPerThread,
+                "Output type not supported."); // 1 byte per element.
 
-  auto inH2 = reinterpret_cast<half2 const *>(&in[0]);
+  auto inH2 = reinterpret_cast<half2 const*>(&in[0]);
   auto localAmaxH2 = __habs2(inH2[0]);
 #pragma unroll
   for (int32_t i = 0; i < NumEltsPerThread / 2; ++i) {
@@ -134,6 +136,102 @@ inline __device__ void convertFp16ToMxE4m3(OutT& out,
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <int32_t NumVals, int32_t NumPackedRegs, typename OutRegs>
+inline __device__ void dsv4Fp8QuantEpilogue(OutRegs& out,
+                                            cutlass::Array<float, NumVals> const& vals,
+                                            float* scalePtr,
+                                            int64_t scaleOffset) {
+  static_assert(NumVals == NumPackedRegs * 4, "One packed register stores four E4M3 values.");
+  static_assert(NumVals == 128, "DSv4 fused epilogue processes one 1x128 quant group.");
+
+  float amax = 0.f;
+#pragma unroll
+  for (int32_t ii = 0; ii < NumVals; ++ii) {
+    amax = fmaxf(amax, fabsf(vals[ii]));
+  }
+
+  float const clampedAmax = fmaxf(amax, 1.0e-12f);
+  float const outScale = clampedAmax * (1.f / 448.f);
+  float const invScale = 448.f / clampedAmax;
+  scalePtr[scaleOffset] = outScale;
+
+#pragma unroll
+  for (int32_t regIdx = 0; regIdx < NumPackedRegs; ++regIdx) {
+    int32_t const ii = regIdx * 4;
+    out[regIdx] = convert_float4_to_e4m3(vals[ii + 0] * invScale,
+                                         vals[ii + 1] * invScale,
+                                         vals[ii + 2] * invScale,
+                                         vals[ii + 3] * invScale);
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <int32_t NumVals, int32_t NumPackedRegs, bool IsNeox, typename OutRegs>
+inline __device__ void dsv4InvRopeFp8QuantEpilogue(OutRegs& out,
+                                                   cutlass::Array<float, NumVals>& vals,
+                                                   float* scalePtr,
+                                                   int32_t const* positionIds,
+                                                   float const* cosSinCache,
+                                                   int64_t scaleOffset,
+                                                   int32_t tokenIdx,
+                                                   int32_t headDimOffset,
+                                                   int32_t warpGrpThreadIdx) {
+  static_assert(NumVals == NumPackedRegs * 4, "One packed register stores four E4M3 values.");
+  static_assert(NumVals == 128, "DSv4 fused epilogue processes one 1x128 quant group.");
+
+  int32_t constexpr ropeStart = 448;
+  int32_t constexpr ropeHalf = 32;
+  int32_t constexpr ropeChunkStart = ropeStart - ropeHalf * 2;
+
+  (void)warpGrpThreadIdx;
+  if (headDimOffset == ropeChunkStart) {
+    int32_t const position = positionIds[tokenIdx];
+    float const* csRow = cosSinCache + position * 64;
+#pragma unroll
+    for (int32_t ropeIdx = 0; ropeIdx < ropeHalf; ++ropeIdx) {
+      int32_t constexpr ropeOffset = ropeStart - ropeChunkStart;
+      float const cosVal = csRow[ropeIdx];
+      float const sinVal = csRow[ropeHalf + ropeIdx];
+      if constexpr (IsNeox) {
+        int32_t const ii = ropeOffset + ropeIdx;
+        int32_t const jj = ii + ropeHalf;
+        float const firstHalf = vals[ii];
+        float const secondHalf = vals[jj];
+        vals[ii] = firstHalf * cosVal + secondHalf * sinVal;
+        vals[jj] = secondHalf * cosVal - firstHalf * sinVal;
+      } else {
+        int32_t const ii = ropeOffset + ropeIdx * 2;
+        int32_t const jj = ii + 1;
+        float const even = vals[ii];
+        float const odd = vals[jj];
+        vals[ii] = even * cosVal + odd * sinVal;
+        vals[jj] = odd * cosVal - even * sinVal;
+      }
+    }
+  }
+
+  float amax = 0.f;
+#pragma unroll
+  for (int32_t ii = 0; ii < NumVals; ++ii) {
+    amax = fmaxf(amax, fabsf(vals[ii]));
+  }
+
+  float const clampedAmax = fmaxf(amax, 1.0e-12f);
+  float const outScale = clampedAmax * (1.f / 448.f);
+  float const invScale = 448.f / clampedAmax;
+  scalePtr[scaleOffset] = outScale;
+
+#pragma unroll
+  for (int32_t regIdx = 0; regIdx < NumPackedRegs; ++regIdx) {
+    int32_t const ii = regIdx * 4;
+    out[regIdx] = convert_float4_to_e4m3(vals[ii + 0] * invScale,
+                                         vals[ii + 1] * invScale,
+                                         vals[ii + 2] * invScale,
+                                         vals[ii + 3] * invScale);
+  }
+}
 
 } // namespace dev
 } // namespace trtllm

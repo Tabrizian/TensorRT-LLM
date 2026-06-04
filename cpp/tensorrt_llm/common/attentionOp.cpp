@@ -1127,6 +1127,19 @@ int AttentionOp::mlaGeneration(
 
         tllmRunnerParams.oPtr = reinterpret_cast<void*>(params.context_buf);
         tllmRunnerParams.oSfPtr = generation_params.context_buf_sf;
+        if (params.dsv4_epilogue_fusion.enabled)
+        {
+            tllmRunnerParams.mDsv4EpilogueFusion.enabled = true;
+            tllmRunnerParams.mDsv4EpilogueFusion.positionIds = params.dsv4_epilogue_fusion.position_ids;
+            tllmRunnerParams.mDsv4EpilogueFusion.cosSinCache = params.dsv4_epilogue_fusion.cos_sin_cache;
+            tllmRunnerParams.mDsv4EpilogueFusion.headsPerGroup = params.dsv4_epilogue_fusion.heads_per_group;
+            tllmRunnerParams.mDsv4EpilogueFusion.scaleBufM = params.dsv4_epilogue_fusion.scale_buf_m;
+            tllmRunnerParams.mDsv4EpilogueFusion.fp8StrideGroup = params.dsv4_epilogue_fusion.fp8_stride_group;
+            tllmRunnerParams.mDsv4EpilogueFusion.fp8StrideToken = params.dsv4_epilogue_fusion.fp8_stride_token;
+            tllmRunnerParams.mDsv4EpilogueFusion.scaleStrideGroup = params.dsv4_epilogue_fusion.scale_stride_group;
+            tllmRunnerParams.mDsv4EpilogueFusion.scaleStrideK = params.dsv4_epilogue_fusion.scale_stride_k;
+            tllmRunnerParams.mDsv4EpilogueFusion.isNeox = params.dsv4_epilogue_fusion.is_neox;
+        }
 
         // softmax stats if needed
         tllmRunnerParams.softmaxStatsPtr = generation_params.softmax_stats;
@@ -3050,9 +3063,14 @@ int AttentionOp::initialize() noexcept
                     qDataType = DATA_TYPE_E4M3;
                     kvDataType = DATA_TYPE_E4M3;
                 }
+                if (mFusesDsv4InvRopeFp8Quant)
+                {
+                    outputDataType = DATA_TYPE_E4M3;
+                }
 
                 // Instantiate the mTllmGenFMHARunner used for MLA
-                mTllmGenFMHARunner.reset(new TllmGenFmhaRunner(qDataType, kvDataType, kvDataType, outputDataType));
+                mTllmGenFMHARunner.reset(new TllmGenFmhaRunner(qDataType, kvDataType, kvDataType, outputDataType, 0, 0,
+                    0, 0, mFusesDsv4InvRopeFp8Quant, /* dsv4InvRopeIsNeox */ false));
             }
             else if (mIsGenerationMLA && !mUseGenFlashMLA)
             {
