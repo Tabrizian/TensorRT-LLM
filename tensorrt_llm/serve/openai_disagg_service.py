@@ -39,6 +39,7 @@ from tensorrt_llm.serve.openai_protocol import (
     PromptTokensDetails,
     UCompletionRequest,
     UCompletionResponse,
+    pack_token_ids_b64,
 )
 from tensorrt_llm.serve.openai_service import OpenAIService
 from tensorrt_llm.serve.perf_metrics import DisaggPerfMetricsCollector
@@ -349,7 +350,15 @@ class OpenAIDisaggregatedService(OpenAIService):
             if isinstance(request, CompletionRequest):
                 request.prompt = ctx_response.prompt_token_ids
             elif isinstance(request, ChatCompletionRequest):
-                request.prompt_token_ids = ctx_response.prompt_token_ids
+                # Pack as base64 int32 so the gen server decodes via numpy
+                # (np.frombuffer) instead of the PyLong_FromString storm of
+                # parsing a ~ISL-sized JSON int array on the request thread.
+                if ctx_response.prompt_token_ids is not None:
+                    request.prompt_token_ids_b64 = pack_token_ids_b64(
+                        ctx_response.prompt_token_ids)
+                    request.prompt_token_ids = None
+                else:
+                    request.prompt_token_ids = ctx_response.prompt_token_ids
         else:
             # no ctx response, it's either a generation-only request or a generation-first disagg request
             request.disaggregated_params = DisaggregatedParams(
