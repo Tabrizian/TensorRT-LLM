@@ -2012,6 +2012,18 @@ class ResponseHooks(ABC):
                      response: UCompletionResponse = None):
         pass
 
+    # Non-abstract (default no-op) so existing implementers keep working.
+    # Fired when the disagg service dispatches a request to a ctx / gen server.
+    def on_ctx_req_sent(self,
+                        ctx_server: str,
+                        request: UCompletionRequest = None):
+        pass
+
+    def on_gen_req_sent(self,
+                        gen_server: str,
+                        request: UCompletionRequest = None):
+        pass
+
 
 async def done_generator() -> AsyncGenerator[bytes, None]:
     yield "data: [DONE]\n\n".encode('utf-8')

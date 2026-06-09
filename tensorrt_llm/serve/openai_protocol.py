@@ -6,6 +6,7 @@ import time
 import uuid
 from typing import Any, Dict, List, Literal, Optional, Union
 
+import numpy as np
 import torch
 import xgrammar
 from fastapi import UploadFile
@@ -79,6 +80,23 @@ def _logit_bias_to_embedding_bias(
             raise
 
     return embedding_bias
+
+
+# Little-endian int32 packing for prompt_token_ids on the disagg generation
+# path. Token ids fit in int32 (vocab << 2^31). Packing as base64'd bytes lets
+# the gen server decode with numpy (np.frombuffer, a C memcpy) instead of paying
+# the PyLong_FromString storm of parsing a ~ISL-sized JSON int array, which was
+# the dominant GIL-held cost on the gen request thread.
+_TOKEN_ID_DTYPE = np.dtype("<i4")
+
+
+def pack_token_ids_b64(ids: List[int]) -> str:
+    return base64.b64encode(
+        np.asarray(ids, dtype=_TOKEN_ID_DTYPE).tobytes()).decode("ascii")
+
+
+def unpack_token_ids_b64(b64: str) -> List[int]:
+    return np.frombuffer(base64.b64decode(b64), dtype=_TOKEN_ID_DTYPE).tolist()
 
 
 class OpenAIBaseModel(BaseModel):
@@ -652,6 +670,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
     # Add prompt_tokens_ids to the request to remove the tokenization
     # in the generation server in disaggreated serving
     prompt_token_ids: Optional[List[int]] = None
+    # Compact transport for prompt_token_ids: base64'd little-endian int32.
+    # Decoded into prompt_token_ids server-side via numpy (see validator below),
+    # avoiding the PyLong_FromString storm of parsing a long JSON int array.
+    prompt_token_ids_b64: Optional[str] = None
     model: str
     frequency_penalty: Optional[float] = 0.0
     logit_bias: Optional[Dict[str, float]] = None
@@ -881,6 +903,16 @@ class ChatCompletionRequest(OpenAIBaseModel):
                     "Parameter 'cache_salt' must be a non-empty string if provided."
                 )
         return v
+
+    @model_validator(mode="after")
+    def _decode_prompt_token_ids_b64(self):
+        # Disagg gen path: decode the compact base64 int32 blob into
+        # prompt_token_ids with numpy (C-speed) instead of JSON int parsing.
+        if (self.prompt_token_ids_b64 is not None
+                and self.prompt_token_ids is None):
+            self.prompt_token_ids = unpack_token_ids_b64(
+                self.prompt_token_ids_b64)
+        return self
 
 
 class KVCacheTruncateRequest(OpenAIBaseModel):

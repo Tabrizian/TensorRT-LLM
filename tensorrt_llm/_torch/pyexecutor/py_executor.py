@@ -708,6 +708,7 @@ class PyExecutor:
             if not self.async_transfer_manager.should_store_blocks:
                 self._terminate_request(request)
 
+    @nvtx_range("PyExecutor._flush_pending_transfer_responses")
     def _flush_pending_transfer_responses(self):
         """Enqueue buffered transfer-completion responses.
 
@@ -722,6 +723,7 @@ class PyExecutor:
             # can complete.
             self._enqueue_responses(responses)
 
+    @nvtx_range("PyExecutor._handle_kv_transfer_timeouts_synced")
     def _handle_kv_transfer_timeouts_synced(self):
         """ADP-safe drain of the KV-transfer-timeout consensus collective.
 
@@ -738,6 +740,7 @@ class PyExecutor:
             self._handle_errors(error_msg="Request timed out (KV transfer)",
                                 requests=timed_out)
 
+    @nvtx_range("PyExecutor._flush_iter_stats_synced")
     def _flush_iter_stats_synced(self):
         """ADP-safe drain of the TLLM_METRICS_ALL_RANKS dict-gather collective.
 
@@ -2163,6 +2166,7 @@ class PyExecutor:
             self.kv_cache_manager.commit_scheduled_kv_cache_stats(
                 scheduled_batch)
 
+    @nvtx_range("PyExecutor._prepare_and_schedule_batch")
     def _prepare_and_schedule_batch(self):
         new_requests = self._fetch_and_activate_new_requests()
         if self.should_stop_processing:
@@ -2415,6 +2419,7 @@ class PyExecutor:
                 return can_forward, True
         return can_forward, False
 
+    @nvtx_range("PyExecutor._handle_disagg_cache_errors_synced")
     def _handle_disagg_cache_errors_synced(self):
         """ADP-safe disagg cache error handler.
 
@@ -2755,15 +2760,18 @@ class PyExecutor:
                 # Need to wait for the copy of previous iteration before modifying any host memory copied to GPU,
                 # and for scheduler V2, it will modify the host page table, so wait before scheduling.
                 # This wait is also needed for legacy scheduler, but it can be pushed later, e.g. before model_engine._prepare_inputs().
-                self.model_engine.wait_for_input_copy()
+                with nvtx_range("loop.wait_for_input_copy"):
+                    self.model_engine.wait_for_input_copy()
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
-                self._handle_control_request()
+                with nvtx_range("loop.handle_control_request"):
+                    self._handle_control_request()
 
                 if scheduled_batch is None:
                     break
 
-                can_forward, should_retry = self._check_benchmark_disagg_gate(
-                    scheduled_batch, can_forward)
+                with nvtx_range("loop.check_benchmark_disagg_gate"):
+                    can_forward, should_retry = self._check_benchmark_disagg_gate(
+                        scheduled_batch, can_forward)
                 if should_retry:
                     self._revert_gen_alloc(scheduled_batch)
                     continue
@@ -2771,8 +2779,9 @@ class PyExecutor:
                 if not self._scheduler_manages_kv_suspend:
                     self._terminate_requests(scheduled_batch.paused_requests)
 
-                can_queue, can_queue_this_rank = self._can_queue(
-                    scheduled_batch)
+                with nvtx_range("loop.can_queue"):
+                    can_queue, can_queue_this_rank = self._can_queue(
+                        scheduled_batch)
 
                 if can_queue:
                     if self.kv_cache_transceiver:
@@ -3076,6 +3085,7 @@ class PyExecutor:
 
         return result_tensors, num_accepted_tokens
 
+    @nvtx_range("PyExecutor._process_previous_batch")
     def _process_previous_batch(self):
         self._handle_canceled_requests()
         finished_requests = self._handle_responses()
@@ -3939,6 +3949,7 @@ class PyExecutor:
                     req.state = LlmRequestState.DISAGG_TRANS_ERROR
         self._check_cache_transfer_errors("generation requests")
 
+    @nvtx_range("PyExecutor._forward_step")
     def _forward_step(
             self,
             scheduled_requests: ScheduledRequests,
@@ -4531,12 +4542,14 @@ class PyExecutor:
             self.responses.pop(id)
             return response
 
+    @nvtx_range("PyExecutor._terminate_requests")
     def _terminate_requests(self, requests_to_terminate):
         # todo: support work with self.inflight_req_ids.
         #       Currently, self.inflight_req_ids is not updated.
         for req in requests_to_terminate:
             self._terminate_request(req)
 
+    @nvtx_range("PyExecutor._pause_requests")
     def _pause_requests(self, requests_to_pause):
         for req in requests_to_pause:
             req.pause(self.max_input_len)

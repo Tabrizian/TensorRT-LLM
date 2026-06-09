@@ -188,7 +188,10 @@ class ZeroMqQueue:
             if self.use_hmac_encryption or self.socket_type == zmq.ROUTER:
                 # Need manual serialization for encryption or ROUTER multipart
                 data = self._prepare_data(obj)
-                self._send_data(data, routing_id=routing_id)
+                # DEBUG: bracket the bare socket hand-off. With set_hwm(0) this
+                # should be ~0us; a long span here would mean receiver backpressure.
+                with nvtx_range_debug("zmq-send", color="green", category="IPC"):
+                    self._send_data(data, routing_id=routing_id)
             else:
                 # Standard socket without encryption - use pyobj directly
                 self.socket.send_pyobj(obj)
@@ -367,9 +370,14 @@ class ZeroMqQueue:
 
     def _prepare_data(self, obj: Any) -> bytes:
         """Serialize object and optionally add HMAC signature."""
-        data = pickle.dumps(obj)  # nosec B301
+        with nvtx_range_debug("pickle", color="cyan", category="IPC"):
+            data = pickle.dumps(obj)  # nosec B301
+        # DEBUG: surface serialized payload size + split pickle vs HMAC so an
+        # nsys trace can attribute the GIL-held "send | IPC" cost.
+        nvtx_mark(f"ipc.payload={len(data) >> 10}KiB", color="cyan", category="IPC")
         if self.use_hmac_encryption:
-            return self._sign_data(data)
+            with nvtx_range_debug("hmac-sha256", color="magenta", category="IPC"):
+                return self._sign_data(data)
         return data
 
     def _parse_data(self, data: bytes) -> Any:

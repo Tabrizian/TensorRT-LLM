@@ -39,6 +39,7 @@ from tensorrt_llm.serve.openai_protocol import (
     PromptTokensDetails,
     UCompletionRequest,
     UCompletionResponse,
+    pack_token_ids_b64,
 )
 from tensorrt_llm.serve.openai_service import OpenAIService
 from tensorrt_llm.serve.perf_metrics import DisaggPerfMetricsCollector
@@ -142,6 +143,8 @@ class OpenAIDisaggregatedService(OpenAIService):
             ctx_server, _ = await self._ctx_router.get_next_server(
                 ctx_req, exclude_server=gen_server
             )
+            if hooks:
+                hooks.on_ctx_req_sent(ctx_server, ctx_req)
             ctx_response = await self._ctx_client.send_request(
                 ctx_req, server=ctx_server, hooks=hooks
             )
@@ -165,6 +168,8 @@ class OpenAIDisaggregatedService(OpenAIService):
                 gen_server, _ = await self._gen_router.get_next_server(
                     gen_req, exclude_server=ctx_server
                 )
+            if hooks:
+                hooks.on_gen_req_sent(gen_server, gen_req)
             gen_response = await self._gen_client.send_request(
                 gen_req, server=gen_server, hooks=hooks
             )
@@ -349,7 +354,15 @@ class OpenAIDisaggregatedService(OpenAIService):
             if isinstance(request, CompletionRequest):
                 request.prompt = ctx_response.prompt_token_ids
             elif isinstance(request, ChatCompletionRequest):
-                request.prompt_token_ids = ctx_response.prompt_token_ids
+                # Pack as base64 int32 so the gen server decodes via numpy
+                # (np.frombuffer) instead of the PyLong_FromString storm of
+                # parsing a ~ISL-sized JSON int array on the request thread.
+                if ctx_response.prompt_token_ids is not None:
+                    request.prompt_token_ids_b64 = pack_token_ids_b64(
+                        ctx_response.prompt_token_ids)
+                    request.prompt_token_ids = None
+                else:
+                    request.prompt_token_ids = ctx_response.prompt_token_ids
         else:
             # no ctx response, it's either a generation-only request or a generation-first disagg request
             request.disaggregated_params = DisaggregatedParams(
@@ -574,6 +587,8 @@ class OpenAIDisaggregatedService(OpenAIService):
             #
             # Fix: eagerly start consuming the gen generator in a background
             # task so the HTTP POST fires, then pipe chunks through a queue.
+            if hooks:
+                hooks.on_gen_req_sent(gen_server, gen_req)
             gen_response = await self._gen_client.send_request(
                 gen_req, server=gen_server, hooks=hooks
             )
@@ -592,6 +607,8 @@ class OpenAIDisaggregatedService(OpenAIService):
 
             # Now send ctx request — gen server has received its request
             try:
+                if hooks:
+                    hooks.on_ctx_req_sent(ctx_server, ctx_req)
                 ctx_response = await self._ctx_client.send_request(
                     ctx_req, server=ctx_server, hooks=hooks
                 )
@@ -626,11 +643,15 @@ class OpenAIDisaggregatedService(OpenAIService):
             # through generator consumption, so asyncio.gather works fine.
             tasks = []
             if need_ctx:
+                if hooks:
+                    hooks.on_ctx_req_sent(ctx_server, ctx_req)
                 tasks.append(
                     asyncio.create_task(
                         self._ctx_client.send_request(ctx_req, server=ctx_server, hooks=hooks)
                     )
                 )
+            if hooks:
+                hooks.on_gen_req_sent(gen_server, gen_req)
             tasks.append(
                 asyncio.create_task(
                     self._gen_client.send_request(gen_req, server=gen_server, hooks=hooks)

@@ -55,6 +55,21 @@ from tensorrt_llm.version import __version__ as VERSION
 TIMEOUT_KEEP_ALIVE = 10  # seconds.
 
 class RawRequestResponseHooks(ResponseHooks):
+    # Funnel counters shared across every request handled by this disagg
+    # server. The event loop is single-threaded, so plain class attributes are
+    # safe to mutate without a lock. Per-server dicts give a breakdown while the
+    # running totals give the aggregate counts.
+    # Inbound / dispatch counts:
+    _num_arrived: int = 0          # requests that entered the disagg service
+    _num_sent_to_ctx: int = 0      # requests dispatched to a ctx server
+    _num_sent_to_gen: int = 0      # requests dispatched to a gen (decode) server
+    # Completion counts:
+    _ctx_completed_by_server: dict = {}
+    _gen_completed_by_server: dict = {}
+    _num_ctx_completed: int = 0
+    _num_gen_completed: int = 0
+    _num_disagg_completed: int = 0
+
     def __init__(self, raw_req: Request, perf_metrics_collector: DisaggPerfMetricsCollector):
         self.raw_req = raw_req
         self.ctx_server = ""
@@ -65,15 +80,42 @@ class RawRequestResponseHooks(ResponseHooks):
 
     def on_req_begin(self, request: UCompletionRequest):
         self.perf_metrics_collector.queue_latency_seconds.observe(get_steady_clock_now_in_seconds() - self.request_arrival_time)
+        cls = RawRequestResponseHooks
+        cls._num_arrived += 1
+        print(f"[disagg] requests arrived: {cls._num_arrived}", flush=True)
+
+    def on_ctx_req_sent(self, ctx_server: str, request: UCompletionRequest = None):
+        cls = RawRequestResponseHooks
+        cls._num_sent_to_ctx += 1
+        print(f"[disagg] requests sent to ctx: {cls._num_sent_to_ctx} "
+              f"(arrived: {cls._num_arrived}, ctx completed: {cls._num_ctx_completed})", flush=True)
+
+    def on_gen_req_sent(self, gen_server: str, request: UCompletionRequest = None):
+        cls = RawRequestResponseHooks
+        cls._num_sent_to_gen += 1
+        print(f"[disagg] requests sent to decode: {cls._num_sent_to_gen} "
+              f"(arrived: {cls._num_arrived}, gen completed: {cls._num_gen_completed})", flush=True)
 
     def on_ctx_resp(self, ctx_server: str, response: UCompletionResponse):
         self.ctx_server = ctx_server
+        cls = RawRequestResponseHooks
+        cls._num_ctx_completed += 1
+        cls._ctx_completed_by_server[ctx_server] = cls._ctx_completed_by_server.get(ctx_server, 0) + 1
+        print(f"[disagg] ctx server {ctx_server} completed {cls._ctx_completed_by_server[ctx_server]} "
+              f"request(s) (total ctx completed: {cls._num_ctx_completed})", flush=True)
 
     def on_first_token(self, gen_server: str, request: UCompletionRequest, response: UCompletionResponse = None):
         self.gen_server = gen_server
         self.server_first_token_time = get_steady_clock_now_in_seconds()
 
     def on_resp_done(self, gen_server: str, request: UCompletionRequest, response: UCompletionResponse = None):
+        cls = RawRequestResponseHooks
+        cls._num_gen_completed += 1
+        cls._gen_completed_by_server[gen_server] = cls._gen_completed_by_server.get(gen_server, 0) + 1
+        cls._num_disagg_completed += 1
+        print(f"[disagg] gen server {gen_server} completed {cls._gen_completed_by_server[gen_server]} "
+              f"request(s) (total gen completed: {cls._num_gen_completed})", flush=True)
+        print(f"[disagg] OAI disagg server completed {cls._num_disagg_completed} request(s)", flush=True)
         if request.disaggregated_params:
             ctx_req_id = request.disaggregated_params.ctx_request_id
             asyncio.create_task(self.perf_metrics_collector.add_per_request_metrics(self.ctx_server, gen_server, ctx_req_id, self.raw_req.state.server_arrival_time, self.server_first_token_time))
