@@ -199,10 +199,69 @@ class PeerRegistrar:
                     break
 
                 if matched_peer_pi is not None:
+                    self._check_pool_coverage(
+                        peer_ri,
+                        self_pv,
+                        self_layer_set,
+                        peer_layer_to_group,
+                        peer_lg,
+                        matched_peer_pi,
+                    )
                     mapping[(self_lg_idx, self_pi)] = (peer_lg_idx, matched_peer_pi)
 
         self._lg_pool_mapping_cache[key] = mapping
         return mapping
+
+    @staticmethod
+    def _check_pool_coverage(
+        peer_ri: RankInfo,
+        self_pv,
+        self_layer_set: set,
+        peer_layer_to_group: Dict[int, int],
+        peer_lg,
+        matched_peer_pi: int,
+    ) -> None:
+        """Refuse silently-partial pool matches.
+
+        ``get_pool_mapping`` pairs each self pool with exactly ONE peer pool,
+        and ``get_kv_map`` transfers one contiguous run of overlapping layers
+        for that pair. Both steps assume the two peers derived the same
+        window-based layer grouping. When they did not — e.g. context and
+        generation servers split an attention layer group's window sizes
+        differently (observed with DSA + MTP, where the generation role's
+        draft-token accounting shifts window sizes so context ends up with two
+        window groups where generation has one) — the peer's layers for this
+        pool span multiple peer layer groups/pools. The extra layers would
+        never be transferred (the KV/indexer cache for them stays
+        uninitialized on the receiver), which silently corrupts generation.
+        Fail loudly instead.
+
+        Layers that do not exist on the peer at all remain allowed — that is
+        the legitimate partial-transfer case (e.g. speculative/MTP layers on
+        one side only) already announced by ``_check_peer_compatible``.
+        """
+        peer_pv = peer_lg.pool_views[matched_peer_pi]
+        peer_covered = set(
+            get_global_layer_ids(peer_lg)
+            if peer_pv.mapper_kind == MapperKind.FLAT
+            else get_pool_view_global_layer_ids(peer_pv, peer_lg)
+        )
+        layers_peer_has = self_layer_set & set(peer_layer_to_group)
+        missing = sorted(layers_peer_has - peer_covered)
+        if missing:
+            raise RuntimeError(
+                "PeerRegistrar.get_pool_mapping: KV pool layout mismatch with peer "
+                f"'{peer_ri.instance_name}' (rank {peer_ri.instance_rank}) for pool role "
+                f"{sorted(self_pv.pool_role)}: global layers {missing[:8]}"
+                f"{'...' if len(missing) > 8 else ''} exist on the peer but are not covered "
+                "by the matched peer pool, so their KV/indexer cache would silently never be "
+                "transferred. The two servers derived different attention-window layer "
+                "groupings for this pool (e.g. DSA + MTP, or a max_attention_window clamp "
+                "under KV memory pressure on only one side — look for an 'Adjusted "
+                "max_attention_window_vec' warning at startup). Align the context and "
+                "generation servers' attention-window layer grouping "
+                "(kv_cache_config.max_attention_window and effective KV memory)."
+            )
 
     def get_kv_map(
         self,

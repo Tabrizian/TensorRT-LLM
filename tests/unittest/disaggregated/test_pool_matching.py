@@ -348,3 +348,78 @@ def test_mixed_mapper_kinds_are_rejected(self_mapper_kind, peer_mapper_kind):
         reg.get_pool_mapping(peer_ri)
     with pytest.raises(ValueError, match="incompatible mapper kinds"):
         reg.get_kv_map(peer_ri, (0, 0), (0, 0))
+
+
+def test_asymmetric_window_grouping_raises():
+    """Peer split the same layers across two window groups; self has one.
+
+    Real-world trigger (GLM-5.2 1p1d): the context server's
+    max_attention_window was clamped under KV memory pressure while the
+    generation server's was not, so context grouped layers {0,1} + {2,3}
+    while generation kept a single {0,1,2,3} group. The single matched pool
+    covers only {0,1}; silently skipping {2,3} corrupts generation. Must
+    raise instead.
+    """
+    self_lg = _attn_lg(
+        0,
+        [(0, 0), (1, 1), (2, 2), (3, 3)],
+        [_key_only_pool_view(0, [0, 1, 2, 3])],
+    )
+    peer_lg_a = _attn_lg(0, [(0, 0), (1, 1)], [_key_only_pool_view(0, [0, 1])])
+    peer_lg_b = _attn_lg(1, [(0, 2), (1, 3)], [_key_only_pool_view(0, [0, 1])])
+
+    reg = _registrar(_page_table([self_lg]), is_mla=True, layer_num_per_pp=[4])
+    peer_ri = _rank_info(
+        name="peer",
+        rank=1,
+        page_table=_page_table([peer_lg_a, peer_lg_b]),
+        is_mla=True,
+        layer_num_per_pp=[4],
+    )
+
+    with pytest.raises(RuntimeError, match="pool layout mismatch"):
+        reg.get_pool_mapping(peer_ri)
+
+
+def test_asymmetric_window_grouping_indexer_raises():
+    """Same asymmetry with a FLAT (indexer) pool alongside the KV pool."""
+    self_lg = _attn_lg(
+        0,
+        [(0, 0), (1, 1), (2, 2), (3, 3)],
+        [_key_only_pool_view(0, [0, 1, 2, 3]), _empty_pool_view(1)],
+    )
+    peer_lg_a = _attn_lg(0, [(0, 0), (1, 1)], [_key_only_pool_view(0, [0, 1]), _empty_pool_view(1)])
+    peer_lg_b = _attn_lg(1, [(0, 2), (1, 3)], [_key_only_pool_view(0, [0, 1]), _empty_pool_view(1)])
+
+    self_pt = _page_table([self_lg], pool_specs={0: [(1024, 64, 0x1000), (512, 64, 0x2000)]})
+    peer_pt = _page_table(
+        [peer_lg_a, peer_lg_b],
+        pool_specs={
+            0: [(1024, 64, 0x3000), (512, 64, 0x4000)],
+            1: [(1024, 64, 0x5000), (512, 64, 0x6000)],
+        },
+    )
+
+    reg = _registrar(self_pt, is_mla=True, layer_num_per_pp=[4])
+    peer_ri = _rank_info(name="peer", rank=1, page_table=peer_pt, is_mla=True, layer_num_per_pp=[4])
+
+    with pytest.raises(RuntimeError, match="pool layout mismatch"):
+        reg.get_pool_mapping(peer_ri)
+
+
+def test_partial_layer_transfer_without_split_still_allowed():
+    """Layers absent from the peer entirely (e.g. MTP-only layers) stay legal."""
+    self_lg = _attn_lg(
+        0,
+        [(0, 0), (1, 1), (2, 2), (3, 3)],
+        [_key_only_pool_view(0, [0, 1, 2, 3])],
+    )
+    peer_lg = _attn_lg(0, [(0, 0), (1, 1)], [_key_only_pool_view(0, [0, 1])])
+
+    reg = _registrar(_page_table([self_lg]), is_mla=True, layer_num_per_pp=[4])
+    peer_ri = _rank_info(
+        name="peer", rank=1, page_table=_page_table([peer_lg]), is_mla=True, layer_num_per_pp=[2]
+    )
+
+    mapping = reg.get_pool_mapping(peer_ri)
+    assert mapping == {(0, 0): (0, 0)}
