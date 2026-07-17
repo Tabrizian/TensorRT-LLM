@@ -2514,6 +2514,92 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
     MODEL_NAME = "zai-org/GLM-5.2"
     MODEL_PATH = f"{llm_models_root()}/GLM-5.2-NVFP4"
 
+    @pytest.mark.parametrize(
+        "tp_size",
+        [
+            pytest.param(
+                4, marks=pytest.mark.skip_less_device(8), id="ctx_tp4_gen_tp4"),
+            pytest.param(
+                2, marks=pytest.mark.skip_less_device(4), id="ctx_tp2_gen_tp2"),
+        ],
+    )
+    def test_nvfp4_cpp_transceiver(self, tp_size):
+        """Disagg ctx->gen transfer through the C++ NIXL transceiver.
+
+        GLM 5.2 uses cross-layer indexer sharing, so the DSA indexer k-cache
+        pool is compact (only full-indexer layers own a row); this exercises
+        the indexer-layer-space transfer path end to end, including the MTP
+        draft layer (always full-indexer).
+        """
+        kv_cache_config = {
+            "free_gpu_memory_fraction": 0.5,
+            "enable_block_reuse": False,
+        }
+        cache_transceiver_config = {
+            "backend": "NIXL",
+        }
+        moe_config = {"backend": "CUTEDSL"}
+        speculative_config = {
+            "decoding_type": "MTP",
+            "max_draft_len": 1,
+        }
+        ctx_server_config = {
+            "tensor_parallel_size": tp_size,
+            "pipeline_parallel_size": 1,
+            "moe_expert_parallel_size": tp_size,
+            "enable_attention_dp": True,
+            "disable_overlap_scheduler": True,
+            "enable_chunked_prefill": True,
+            "cuda_graph_config": None,
+            "trust_remote_code": True,
+            "max_seq_len": 8192,
+            "kv_cache_config": kv_cache_config,
+            "moe_config": moe_config,
+            "speculative_config": speculative_config,
+            "cache_transceiver_config": cache_transceiver_config,
+        }
+        gen_server_config = {
+            "tensor_parallel_size": tp_size,
+            "pipeline_parallel_size": 1,
+            "moe_expert_parallel_size": tp_size,
+            "enable_attention_dp": True,
+            "disable_overlap_scheduler": False,
+            "enable_chunked_prefill": True,
+            "trust_remote_code": True,
+            "max_seq_len": 8192,
+            "kv_cache_config": kv_cache_config,
+            "moe_config": moe_config,
+            "speculative_config": speculative_config,
+            "cache_transceiver_config": cache_transceiver_config,
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1
+            },
+            "generation_servers": {
+                "num_instances": 1
+            }
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config,
+                                      gen_server_config,
+                                      self.MODEL_PATH,
+                                      max_workers=128) as llm:
+            # launch_disaggregated_llm builds a bare LlmArgs for the DuckLLM,
+            # so the specs used for the accuracy reference lookup must be
+            # filled in to match the registered entry (NVFP4 + FP8 KV cache
+            # + MTP).
+            llm.args.quant_config.kv_cache_quant_algo = "FP8"
+            llm.args.speculative_config = MTPDecodingConfig(
+                max_draft_len=speculative_config["max_draft_len"])
+            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+
+    @pytest.mark.skip(
+        reason="The Python KV transceiver runtime does not support the "
+        "compact (per-layer masked) DSA indexer k-cache pool yet; GLM 5.2 "
+        "disagg runs through the C++ transceiver (test_nvfp4_cpp_transceiver).")
     @pytest.mark.skip_less_device(8)
     @pytest.mark.parametrize("use_kv_cache_manager_v2", [False],
                              ids=["cache_mgr_v1"])
