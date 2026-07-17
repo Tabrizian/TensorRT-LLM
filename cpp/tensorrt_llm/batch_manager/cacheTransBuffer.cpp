@@ -214,28 +214,42 @@ size_t CacheTransBufferManager::computeTransferBufferSize(
         SizeType32 kvCacheByteSizePerTokenPerLayer = 0;
         if (transferIndexerKCache)
         {
-            kvCacheByteSizePerTokenPerLayer
-                = cacheManager->getIndexerKCachePool()->getDimension<-1>() * dataSize / tokensPerBlock;
-        }
-        else
-        {
-            auto primaryPool = cacheManager->getPrimaryPool(0);
-            kvCacheByteSizePerTokenPerLayer
-                = primaryPool->getDimension<-1>() * primaryPool->getDimension<2>() * dataSize / tokensPerBlock;
-        }
-        for (auto layerId = 0; layerId < cacheManager->getBlockManager().getNumLayers(); layerId++)
-        {
-            auto poolIdx = cacheManager->getBlockManager().getLayerPoolIdx(layerId);
-            auto windowSize = static_cast<size_t>(cacheManager->getBlockManager().getPoolWindowSize(poolIdx));
-            auto alignedWindowSize = (windowSize + tokensPerBlock - 1) / tokensPerBlock * tokensPerBlock;
+            auto const indexerPool = cacheManager->getIndexerKCachePool();
+            kvCacheByteSizePerTokenPerLayer = indexerPool->getDimension<-1>() * dataSize / tokensPerBlock;
+            // The (possibly compact) indexer pool holds one row per full-indexer layer and all
+            // rows share KV pool 0's window; size the buffer from the pool's actual layer count
+            // instead of the attention layer count.
+            auto const numIndexerLayers = static_cast<SizeType32>(indexerPool->getDimension<1>());
+            auto const windowSize = static_cast<size_t>(cacheManager->getBlockManager().getPoolWindowSize(0));
+            auto const alignedWindowSize = (windowSize + tokensPerBlock - 1) / tokensPerBlock * tokensPerBlock;
             auto validTokenNum = (alignedWindowSize < maxNumTokens.value() ? alignedWindowSize : maxNumTokens.value());
             if (common::getEnvKVCacheTransferAllBlocksForWindow())
             {
                 validTokenNum = maxNumTokens.value();
             }
             validTokenNum += tokensPerBlock; // add one more block
+            bufferSizeFromMaxNumToken = validTokenNum * kvCacheByteSizePerTokenPerLayer * numIndexerLayers;
+        }
+        else
+        {
+            auto primaryPool = cacheManager->getPrimaryPool(0);
+            kvCacheByteSizePerTokenPerLayer
+                = primaryPool->getDimension<-1>() * primaryPool->getDimension<2>() * dataSize / tokensPerBlock;
+            for (auto layerId = 0; layerId < cacheManager->getBlockManager().getNumLayers(); layerId++)
+            {
+                auto poolIdx = cacheManager->getBlockManager().getLayerPoolIdx(layerId);
+                auto windowSize = static_cast<size_t>(cacheManager->getBlockManager().getPoolWindowSize(poolIdx));
+                auto alignedWindowSize = (windowSize + tokensPerBlock - 1) / tokensPerBlock * tokensPerBlock;
+                auto validTokenNum
+                    = (alignedWindowSize < maxNumTokens.value() ? alignedWindowSize : maxNumTokens.value());
+                if (common::getEnvKVCacheTransferAllBlocksForWindow())
+                {
+                    validTokenNum = maxNumTokens.value();
+                }
+                validTokenNum += tokensPerBlock; // add one more block
 
-            bufferSizeFromMaxNumToken += validTokenNum * kvCacheByteSizePerTokenPerLayer;
+                bufferSizeFromMaxNumToken += validTokenNum * kvCacheByteSizePerTokenPerLayer;
+            }
         }
     }
 

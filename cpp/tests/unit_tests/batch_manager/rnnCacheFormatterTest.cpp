@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -856,4 +856,85 @@ TEST_F(HybridModelCounterpartsTest, AsymmetricContextPPGreaterThanGenPP)
 
     merged = mergeCounterparts(kvCounterParts, rnnCounterParts);
     EXPECT_EQ(merged, std::vector<SizeType32>({2}));
+}
+
+// ---------------------------------------------------------------------------
+// Indexer K cache targetIRanks tests (compact indexer pool: per-layer indexer
+// mask, e.g. GLM 5.2 cross-layer indexer sharing).
+// ---------------------------------------------------------------------------
+
+class IndexerTargetIRanksTest : public ::testing::Test
+{
+protected:
+    // MLA CacheState with an indexer K cache; indexerLayerNumPerPP empty = dense.
+    static texec::kv_cache::CacheState makeMlaCacheState(SizeType32 numLayers, SizeType32 tp, SizeType32 pp,
+        std::vector<SizeType32> const& attentionLayersPerPP, std::vector<SizeType32> const& indexerLayersPerPP = {})
+    {
+        return texec::kv_cache::CacheState(numLayers, /*nbKvHeads=*/1, /*sizePerHead=*/576, /*tokensPerBlock=*/32, tp,
+            pp, /*contextParallelism=*/1, attentionLayersPerPP, nvinfer1::DataType::kHALF,
+            texec::kv_cache::CacheState::AttentionType::kMLA, /*kvFactor=*/1, /*enableAttentionDP=*/false,
+            /*DPrank=*/0, /*DPsize=*/0, /*enableBlockReuse=*/false, /*enablePartialReuse=*/false,
+            /*hasIndexerKCache=*/true, /*indexerDimPerHead=*/128, /*indexerKCacheQuantBlockSize=*/128,
+            /*indexerKCacheUseFp4=*/false, indexerLayersPerPP);
+    }
+};
+
+// Dense fallback: without indexer layer counts the indexer pass matches the attention pass.
+TEST_F(IndexerTargetIRanksTest, DenseFallbackMatchesAttention)
+{
+    auto contextState = makeMlaCacheState(/*numLayers=*/8, /*tp=*/1, /*pp=*/2, {4, 4});
+    auto genState = makeMlaCacheState(/*numLayers=*/8, /*tp=*/1, /*pp=*/2, {4, 4});
+
+    for (int selfRank = 0; selfRank < 2; selfRank++)
+    {
+        auto const attention = texec::kv_cache::targetIRanks(genState, contextState, selfRank);
+        auto const indexer = texec::kv_cache::targetIRanksForIndexerKCache(genState, contextState, selfRank);
+        EXPECT_EQ(indexer.mIRanks, attention.mIRanks);
+        EXPECT_EQ(indexer.mPeerLayerNumInDomainPP, attention.mPeerLayerNumInDomainPP);
+    }
+}
+
+// Same PP both sides: peer counts equal the local compact counts.
+TEST_F(IndexerTargetIRanksTest, SamePPCompactCounts)
+{
+    auto contextState = makeMlaCacheState(/*numLayers=*/8, /*tp=*/1, /*pp=*/2, {4, 4}, {3, 2});
+    auto genState = makeMlaCacheState(/*numLayers=*/8, /*tp=*/1, /*pp=*/2, {4, 4}, {3, 2});
+
+    auto const rank0 = texec::kv_cache::targetIRanksForIndexerKCache(genState, contextState, 0);
+    EXPECT_EQ(rank0.mIRanks, std::vector<int>({0}));
+    EXPECT_EQ(rank0.mPeerLayerNumInDomainPP, std::vector<int>({3}));
+
+    auto const rank1 = texec::kv_cache::targetIRanksForIndexerKCache(genState, contextState, 1);
+    EXPECT_EQ(rank1.mIRanks, std::vector<int>({1}));
+    EXPECT_EQ(rank1.mPeerLayerNumInDomainPP, std::vector<int>({2}));
+}
+
+// PP resharding: the indexer counts follow the attention-layer overlaps in indexer space.
+TEST_F(IndexerTargetIRanksTest, PPReshardingSplitsIndexerCounts)
+{
+    // Self: PP=2 with attention {4, 4} and indexer {3, 2}; peer: PP=1 with all 8 / 5.
+    auto selfState = makeMlaCacheState(/*numLayers=*/8, /*tp=*/1, /*pp=*/2, {4, 4}, {3, 2});
+    auto peerState = makeMlaCacheState(/*numLayers=*/8, /*tp=*/1, /*pp=*/1, {8}, {5});
+
+    auto const rank0 = texec::kv_cache::targetIRanksForIndexerKCache(peerState, selfState, 0);
+    EXPECT_EQ(rank0.mPeerLayerNumInDomainPP, std::vector<int>({3}));
+
+    auto const rank1 = texec::kv_cache::targetIRanksForIndexerKCache(peerState, selfState, 1);
+    EXPECT_EQ(rank1.mPeerLayerNumInDomainPP, std::vector<int>({2}));
+
+    // Reverse direction: PP=1 self sees both peers with the split counts.
+    auto const wide = texec::kv_cache::targetIRanksForIndexerKCache(selfState, peerState, 0);
+    EXPECT_EQ(wide.mDomainPPSize, 2);
+    EXPECT_EQ(wide.mPeerLayerNumInDomainPP, std::vector<int>({3, 2}));
+}
+
+// A peer whose attention overlap holds no full-indexer layer gets a zero count.
+TEST_F(IndexerTargetIRanksTest, ZeroCountPeerInDomain)
+{
+    auto selfState = makeMlaCacheState(/*numLayers=*/8, /*tp=*/1, /*pp=*/1, {8}, {2});
+    auto peerState = makeMlaCacheState(/*numLayers=*/8, /*tp=*/1, /*pp=*/4, {2, 2, 2, 2}, {1, 0, 0, 1});
+
+    auto const info = texec::kv_cache::targetIRanksForIndexerKCache(peerState, selfState, 0);
+    EXPECT_EQ(info.mDomainPPSize, 4);
+    EXPECT_EQ(info.mPeerLayerNumInDomainPP, std::vector<int>({1, 0, 0, 1}));
 }

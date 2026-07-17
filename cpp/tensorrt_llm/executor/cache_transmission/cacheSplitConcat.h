@@ -59,6 +59,16 @@ TargetRanksInfo targetIRanks(
 TargetRanksInfo targetIRanksForRnn(
     kv_cache::CacheState const& peerCacheState, kv_cache::CacheState const& selfCacheState, int selfRank);
 
+//! \brief Target ranks info for the indexer K cache pass.
+//! \details Shares the attention pass's rank topology (same connection set), but recomputes
+//! mPeerLayerNumInDomainPP in "indexer layer space": with a compact indexer pool (per-layer
+//! indexer mask, e.g. GLM 5.2 cross-layer indexer sharing) only full-indexer layers own a pool
+//! row, so the per-peer counts are the number of full-indexer layers inside each attention-layer
+//! overlap. Peers whose overlap holds no full-indexer layer get a zero count (nothing exchanged).
+//! Falls back to the attention counts when neither side carries indexer layer counts (dense).
+TargetRanksInfo targetIRanksForIndexerKCache(
+    kv_cache::CacheState const& peerCacheState, kv_cache::CacheState const& selfCacheState, int selfRank);
+
 /**
  * @brief Calculate the number of blocks allocated to a specific Context Parallelism (CP) rank.
  *

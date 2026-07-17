@@ -213,11 +213,11 @@ def build_page_table(kv_cache_manager: KVCacheManager) -> KVCachePageTable:
                 local_indexer_mask[lid] for lid in local_layer_ids
             ):
                 raise NotImplementedError(
-                    "Disaggregated KV transfer does not support a compact "
-                    "(per-layer masked) indexer k-cache pool yet: "
+                    "The Python KV transceiver runtime does not support a "
+                    "compact (per-layer masked) indexer k-cache pool yet: "
                     f"{sum(local_indexer_mask[lid] for lid in local_layer_ids)}"
                     f" of {len(local_layer_ids)} layers in this layer group "
-                    "own an indexer k-cache. Disable disaggregated serving "
+                    "own an indexer k-cache. Use the C++ cache transceiver "
                     "for models with cross-layer indexer sharing (e.g. "
                     "GLM 5.2)."
                 )

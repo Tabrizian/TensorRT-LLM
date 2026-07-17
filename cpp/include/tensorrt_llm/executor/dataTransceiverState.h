@@ -53,7 +53,8 @@ public:
         std::vector<SizeType32> const& attentionLayerNumPerPP, nvinfer1::DataType dataType,
         AttentionType attentionType = AttentionType::kDEFAULT, int kvFactor = 2, bool enableBlockReuse = false,
         bool enablePartialReuse = false, bool hasIndexerKCache = false, SizeType32 indexerDimPerHead = 0,
-        SizeType32 indexerKCacheQuantBlockSize = 128, bool indexerKCacheUseFp4 = false)
+        SizeType32 indexerKCacheQuantBlockSize = 128, bool indexerKCacheUseFp4 = false,
+        std::vector<SizeType32> const& indexerLayerNumPerPP = {})
         : mModelConfig(std::move(modelConfig))
         , mParallelConfig{worldConfig.getTensorParallelism(), worldConfig.getPipelineParallelism(),
               worldConfig.getContextParallelism(), worldConfig.enableAttentionDP(), worldConfig.getTensorParallelRank(),
@@ -67,6 +68,7 @@ public:
         mIndexerDimPerHead = indexerDimPerHead;
         mIndexerKCacheQuantBlockSize = indexerKCacheQuantBlockSize;
         mIndexerKCacheUseFp4 = indexerKCacheUseFp4;
+        mIndexerLayerNumPerPP = indexerLayerNumPerPP;
     }
 
     CacheState(std::vector<SizeType32> nbKvHeadPerLayer, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
@@ -75,7 +77,7 @@ public:
         AttentionType attentionType = AttentionType::kDEFAULT, int kvFactor = 2, bool enableAttentionDP = false,
         int DPrank = 0, int DPsize = 0, bool enableBlockReuse = false, bool enablePartialReuse = false,
         bool hasIndexerKCache = false, SizeType32 indexerDimPerHead = 0, SizeType32 indexerKCacheQuantBlockSize = 128,
-        bool indexerKCacheUseFp4 = false)
+        bool indexerKCacheUseFp4 = false, std::vector<SizeType32> const& indexerLayerNumPerPP = {})
         : mModelConfig{std::move(nbKvHeadPerLayer), sizePerHead, tokensPerBlock}
         , mParallelConfig{tensorParallelism, pipelineParallelism, contextParallelism, enableAttentionDP, DPrank, DPsize,
               attentionLayerNumPerPP}
@@ -88,6 +90,7 @@ public:
         mIndexerDimPerHead = indexerDimPerHead;
         mIndexerKCacheQuantBlockSize = indexerKCacheQuantBlockSize;
         mIndexerKCacheUseFp4 = indexerKCacheUseFp4;
+        mIndexerLayerNumPerPP = indexerLayerNumPerPP;
     }
 
     CacheState(SizeType32 nbAttentionLayers, SizeType32 nbKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
@@ -96,7 +99,7 @@ public:
         AttentionType attentionType = AttentionType::kDEFAULT, int kvFactor = 2, bool enableAttentionDP = false,
         int DPrank = 0, int DPsize = 0, bool enableBlockReuse = false, bool enablePartialReuse = false,
         bool hasIndexerKCache = false, SizeType32 indexerDimPerHead = 0, SizeType32 indexerKCacheQuantBlockSize = 128,
-        bool indexerKCacheUseFp4 = false)
+        bool indexerKCacheUseFp4 = false, std::vector<SizeType32> const& indexerLayerNumPerPP = {})
         : mModelConfig{std::vector(nbAttentionLayers, nbKvHeads), sizePerHead, tokensPerBlock}
         , mParallelConfig{tensorParallelism, pipelineParallelism, contextParallelism, enableAttentionDP, DPrank, DPsize,
               attentionLayerNumPerPP}
@@ -109,6 +112,7 @@ public:
         mIndexerDimPerHead = indexerDimPerHead;
         mIndexerKCacheQuantBlockSize = indexerKCacheQuantBlockSize;
         mIndexerKCacheUseFp4 = indexerKCacheUseFp4;
+        mIndexerLayerNumPerPP = indexerLayerNumPerPP;
     }
 
     [[nodiscard]] bool operator==(kv_cache::CacheState const& other) const noexcept
@@ -119,7 +123,8 @@ public:
             && mEnablePartialReuse == other.mEnablePartialReuse && mHasIndexerKCache == other.mHasIndexerKCache
             && mIndexerDimPerHead == other.mIndexerDimPerHead
             && mIndexerKCacheQuantBlockSize == other.mIndexerKCacheQuantBlockSize
-            && mIndexerKCacheUseFp4 == other.mIndexerKCacheUseFp4;
+            && mIndexerKCacheUseFp4 == other.mIndexerKCacheUseFp4
+            && mIndexerLayerNumPerPP == other.mIndexerLayerNumPerPP;
     }
 
     struct ModelConfig
@@ -298,6 +303,15 @@ public:
         return mIndexerKCacheUseFp4;
     }
 
+    //! \brief Per-PP-rank indexer K cache layer counts. With a compact indexer pool (per-layer
+    //! indexer mask, e.g. GLM 5.2 cross-layer indexer sharing) only full-indexer layers own a
+    //! pool row, so these counts can be smaller than the attention layer counts. Falls back to
+    //! the attention layer counts when unset (dense legacy layout).
+    [[nodiscard]] std::vector<SizeType32> const& getIndexerLayerNumPerPP() const
+    {
+        return mIndexerLayerNumPerPP.empty() ? mParallelConfig.mAttentionLayerNumPerPP : mIndexerLayerNumPerPP;
+    }
+
     // =========================================================================
     // RNN/Mamba cache state (optional, present only for hybrid models)
     // =========================================================================
@@ -360,6 +374,12 @@ public:
         sstring << "indexerDimPerHead:" << mIndexerDimPerHead << "\n";
         sstring << "indexerKCacheQuantBlockSize:" << mIndexerKCacheQuantBlockSize << "\n";
         sstring << "indexerKCacheUseFp4:" << mIndexerKCacheUseFp4 << "\n";
+        sstring << "indexerLayerNumPerPP:";
+        for (auto layerNum : mIndexerLayerNumPerPP)
+        {
+            sstring << layerNum << ",";
+        }
+        sstring << "\n";
         if (mRnnCacheState.has_value())
         {
             auto const& rnn = mRnnCacheState.value();
@@ -403,6 +423,9 @@ private:
     SizeType32 mIndexerDimPerHead{0};
     SizeType32 mIndexerKCacheQuantBlockSize{128};
     bool mIndexerKCacheUseFp4{false};
+    // Per-PP-rank indexer K cache layer counts (compact indexer pool). Empty = every attention
+    // layer owns an indexer K cache row (dense legacy layout); see getIndexerLayerNumPerPP().
+    std::vector<SizeType32> mIndexerLayerNumPerPP;
     // RNN/Mamba cache state (optional, for hybrid models)
     std::optional<RnnCacheState> mRnnCacheState;
 };
