@@ -142,8 +142,14 @@ def create_dsa_cache_manager(
     num_layers: int = 1,
     indexer_k_dtype: str = "fp8",
     index_topk: int = 2048,
+    pretrained_config=None,
 ):
-    """Helper to create a DSACacheManager for testing."""
+    """Helper to create a DSACacheManager for testing.
+
+    ``pretrained_config`` (e.g. a SimpleNamespace with index_topk_freq /
+    index_skip_topk_offset) enables cross-layer indexer sharing: shared
+    layers own no row in the compact indexer k-cache pool.
+    """
 
     sparse_attn_config = DeepSeekSparseAttentionConfig(
         index_head_dim=head_dim,
@@ -175,6 +181,7 @@ def create_dsa_cache_manager(
         mapping=mapping,
         dtype=DataType.HALF,
         sparse_attention_config=sparse_attn_config,
+        pretrained_config=pretrained_config,
     )
 
     return cache_manager, sparse_attn_config

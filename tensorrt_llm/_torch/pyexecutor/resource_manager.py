@@ -291,6 +291,13 @@ class KVCacheManager(BaseResourceManager):
         indexer_k_cache_quant_block_size: int = 128,
         indexer_k_cache_index_head_dim: int = 0,
         indexer_k_cache_use_fp4: bool = False,
+        # Optional per-layer indexer K cache mask indexed by *global* layer idx
+        # (including trailing spec/MTP layers appended by get_pp_layers). None =
+        # every layer owns an indexer K cache row (dense, legacy layout). When
+        # set, only masked-in layers get a row in the (compact) C++ indexer
+        # pool — e.g. GLM 5.2 cross-layer indexer sharing where "shared" layers
+        # never touch the indexer K cache.
+        indexer_k_cache_layer_mask: Optional[List[bool]] = None,
         is_estimating_kv_cache: bool = False,
         execution_stream: Optional[torch.cuda.Stream] = None,
         linear_attention_metadata: Optional[LinearAttentionMetadata] = None,
@@ -320,6 +327,22 @@ class KVCacheManager(BaseResourceManager):
             idx: offset
             for offset, idx in enumerate(self.pp_layers)
         }
+
+        # Slice the global per-layer indexer mask down to this rank's local
+        # layers (same order as num_kv_heads_per_layer). The C++ side expects
+        # one entry per local layer. Must happen before any
+        # get_cache_bytes_per_token call below (DSACacheManager's override
+        # reads it when sizing the block budget).
+        if indexer_k_cache_layer_mask is not None:
+            assert len(indexer_k_cache_layer_mask) >= max(self.pp_layers) + 1, (
+                f"indexer_k_cache_layer_mask covers "
+                f"{len(indexer_k_cache_layer_mask)} layers but this rank "
+                f"manages global layer {max(self.pp_layers)}")
+            self.indexer_k_cache_local_layer_mask: Optional[List[bool]] = [
+                bool(indexer_k_cache_layer_mask[i]) for i in self.pp_layers
+            ]
+        else:
+            self.indexer_k_cache_local_layer_mask = None
 
         self.kv_connector_manager = kv_connector_manager
 
@@ -614,6 +637,7 @@ class KVCacheManager(BaseResourceManager):
             indexer_k_cache_quant_block_size,
             'indexer_k_cache_index_head_dim': indexer_k_cache_index_head_dim,
             'indexer_k_cache_use_fp4': indexer_k_cache_use_fp4,
+            'indexer_k_cache_layer_mask': self.indexer_k_cache_local_layer_mask,
             'linear_attention_metadata': linear_attention_metadata,
             # Forward the (possibly remapped) per-pool configurations.
             # window_size values are aligned with the post-clamp sizes.
@@ -1529,6 +1553,13 @@ class KVCacheManager(BaseResourceManager):
             )
 
     def get_indexer_k_cache_pool_data(self, layer_idx: int) -> torch.Tensor:
+        """Return the indexer K cache rows of a *local* layer offset.
+
+        The C++ binding translates the local layer offset to its row within
+        the (possibly compact) indexer pool and raises for layers masked out
+        by ``indexer_k_cache_layer_mask`` — callers must only pass layers that
+        own an indexer K cache.
+        """
         result = self.impl.get_indexer_k_cache_pool_data(layer_idx)
         return result.view(result.shape[0], -1)
 
