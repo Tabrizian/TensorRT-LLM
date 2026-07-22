@@ -1480,11 +1480,24 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                               1) // tokens_per_block
         max_blocks_used = num_blocks_per_seq.max().item(
         ) if self.num_seqs > 0 else 1
-        # pool_indices already has correct values; set padding to -1
-        host_block_table = pool_indices[:, :max_blocks_used].clone()
-        for i in range(self.num_seqs):
-            if num_blocks_per_seq[i] < max_blocks_used:
-                host_block_table[i, num_blocks_per_seq[i]:] = -1
+        # pool_indices already has correct values; set padding to -1.
+        # Stage through a fresh pinned buffer: pool_indices (a chain of CPU
+        # tensor ops) is pageable, and the async H2D below from pageable
+        # memory blocks the calling thread until the copy completes behind
+        # everything already queued on the execution stream — up to a full
+        # decode step under the overlap scheduler (measured 26 ms/iter on
+        # GLM 5.2 GB300 decode). A fresh pinned allocation comes from the
+        # caching host allocator, which holds it until the consuming copy
+        # completes (same pattern as
+        # KVCacheManager._stage_block_offsets_for_copy, nvbug 6293536).
+        host_block_table = torch.empty((pool_indices.shape[0], max_blocks_used),
+                                       dtype=pool_indices.dtype,
+                                       pin_memory=prefer_pinned())
+        host_block_table.copy_(pool_indices[:, :max_blocks_used])
+        pad_cols = torch.arange(max_blocks_used, dtype=num_blocks_per_seq.dtype)
+        host_block_table.masked_fill_(
+            pad_cols.unsqueeze(0)
+            >= num_blocks_per_seq[:self.num_seqs].unsqueeze(1), -1)
         # Copy to GPU
         self.block_table[:self.num_seqs, :max_blocks_used].copy_(
             host_block_table, non_blocking=True)
