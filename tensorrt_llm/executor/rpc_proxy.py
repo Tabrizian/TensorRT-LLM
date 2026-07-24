@@ -268,6 +268,11 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
         if self._shutdown_event.is_set():
             return
         self._shutdown_event.set()
+        # Wake the submit flusher so it drains any buffered requests and exits
+        # promptly instead of on its 0.5s poll.
+        if getattr(self, "_submit_cv", None) is not None:
+            with self._submit_cv:
+                self._submit_cv.notify_all()
         logger_debug("Shutting down GenerationExecutorRpcProxy", color="yellow")
 
         # 1. shutdown the rpc server (PyExecutor Rank 0 + RPC server)

@@ -2,6 +2,7 @@ import asyncio
 import atexit
 import os
 import threading
+import time
 from typing import Callable, List, Optional
 
 from .._utils import nvtx_range_debug
@@ -37,6 +38,30 @@ class RpcExecutorMixin:
         self.main_loop_task_obj = None
         self.main_loop = None
         self.main_loop_thread = None
+
+        # --- submit batching accumulator -------------------------------------
+        # Coalesce a burst of fire-and-forget submits (one per disagg GEN HTTP
+        # request; each openai_server generate_async is a separate coroutine)
+        # into ONE submit_batch RPC. A short flush window absorbs the burst the
+        # disagg coordinator forwards when many context phases complete
+        # together, so the gen worker does one RPC dispatch + one GIL-holding
+        # enqueue loop instead of ~70 threads thrashing the decode loop.
+        # TLLM_RPC_SUBMIT_BATCH_WINDOW_MS=0 restores per-request behavior.
+        self._submit_lock = threading.Lock()
+        self._submit_cv = threading.Condition(self._submit_lock)
+        self._submit_buffer: List[GenerationRequest] = []
+        self._submit_batch_max = int(
+            os.environ.get("TLLM_RPC_SUBMIT_BATCH_MAX", "256"))
+        self._submit_flush_window_s = float(
+            os.environ.get("TLLM_RPC_SUBMIT_BATCH_WINDOW_MS", "1")) / 1000.0
+        self._submit_flush_enabled = self._submit_flush_window_s > 0
+        self._submit_flusher_thread = None
+        if self._submit_flush_enabled:
+            self._submit_flusher_thread = threading.Thread(
+                target=self._submit_flusher_loop,
+                daemon=True,
+                name="rpc_submit_flusher")
+            self._submit_flusher_thread.start()
 
     def setup_mainloop(
         self, tasks: Optional[List[Callable]] = None, thread_name: str = "rpc_proxy_main_loop"
@@ -83,10 +108,9 @@ class RpcExecutorMixin:
         request.set_id(self._get_next_client_id())
         logprob_params = self._get_logprob_params(request)
 
-        # submit is a fire-and-forget operation, don't need to wait for response
-        with nvtx_range_debug("RPCExecutor.submit", color="green", category="Proxy"):
-            self.rpc_client.submit(request).remote(need_response=False)
-
+        # Client id + GenerationResult are assigned/registered synchronously so
+        # the caller's `async for res in promise` works immediately, regardless
+        # of when the request is actually shipped (batching defers only the send).
         result = GenerationResult(
             request,
             background_error_handler=self._handle_background_error,
@@ -96,7 +120,47 @@ class RpcExecutorMixin:
         )
         self._results[request.id] = result
 
+        if not self._submit_flush_enabled:
+            # Legacy path: one fire-and-forget RPC per request.
+            with nvtx_range_debug("RPCExecutor.submit", color="green", category="Proxy"):
+                self.rpc_client.submit(request).remote(need_response=False)
+            return result
+
+        with self._submit_cv:
+            self._submit_buffer.append(request)
+            over_cap = len(self._submit_buffer) >= self._submit_batch_max
+            self._submit_cv.notify()
+        if over_cap:
+            # Don't let a runaway burst grow the buffer unbounded; flush now.
+            self._send_submit_batch(self._drain_submit_buffer())
         return result
+
+    def _drain_submit_buffer(self) -> List[GenerationRequest]:
+        with self._submit_lock:
+            batch, self._submit_buffer = self._submit_buffer, []
+        return batch
+
+    def _send_submit_batch(self, batch: List[GenerationRequest]) -> None:
+        if not batch:
+            return
+        with nvtx_range_debug(f"RPCExecutor.submit_batch[{len(batch)}]",
+                              color="green", category="Proxy"):
+            # ONE .remote() ships the whole list in a single RPC round-trip.
+            self.rpc_client.submit_batch(batch).remote(need_response=False)
+
+    def _submit_flusher_loop(self) -> None:
+        while not self._shutdown_event.is_set():
+            with self._submit_cv:
+                while not self._submit_buffer and not self._shutdown_event.is_set():
+                    self._submit_cv.wait(timeout=0.5)
+            if self._shutdown_event.is_set():
+                break
+            # Let a short window elapse so the rest of the burst lands in the
+            # same batch before we drain-and-ship.
+            time.sleep(self._submit_flush_window_s)
+            self._send_submit_batch(self._drain_submit_buffer())
+        # Final drain on shutdown.
+        self._send_submit_batch(self._drain_submit_buffer())
 
     def handle_responses(self, responses: list[GenerationResult]) -> bool:
         async_queues = []

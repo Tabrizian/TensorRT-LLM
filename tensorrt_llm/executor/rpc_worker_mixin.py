@@ -55,6 +55,30 @@ class RpcWorkerMixin:
             logger_debug(f"[worker] Submitted request {request.id}", color="green")
             return result
 
+    def submit_batch(self, requests: list):
+        """Enqueue a burst of requests in ONE RPC dispatch.
+
+        Loops the normal single-request submit path so the RPC round-trip and
+        the RPCServer threadpool dispatch happen once for the whole burst
+        instead of once per request. A single worker thread then holds the GIL
+        for the enqueue/token-memcpy loop (one competitor for the decode
+        thread) instead of up to num_workers threads thrashing it against the
+        decode loop (~18% gen GPU-idle on GLM 5.2 disagg). Semantically
+        identical to N single submits; per-request try/except preserves the
+        fire-and-forget property that one bad request doesn't sink the batch.
+        """
+        with nvtx_range_debug(f"RpcWorker.submit_batch[{len(requests)}]",
+                              color="blue", category="Worker"):
+            for request in requests:
+                try:
+                    super().submit(request)
+                except Exception as e:
+                    logger_debug(
+                        f"[worker] submit_batch: request "
+                        f"{getattr(request, 'id', '?')} failed: {e}",
+                        color="red")
+                    self._handle_background_error(e)
+
     def fetch_responses(self, timeout: Optional[float] = None) -> list:
         """Fetch responses from the response queue (blocking)."""
         logger_debug(f"[worker] RpcWorker {self.rank} is fetching responses", color="yellow")
