@@ -268,6 +268,14 @@ class DisaggTransferAdmissionController:
         self.max_transfer_blocks = self._to_block_budget(
             max_tokens_in_buffer, tokens_per_block)
         self.tokens_per_block = tokens_per_block or 0
+        # Escape hatch (A/B): TRTLLM_DISABLE_DISAGG_GEN_ADMISSION=1 forces the
+        # controller off so every candidate is admitted immediately (the
+        # pre-#15356 behavior). The FCFS deferral otherwise piles requests up
+        # and admits them in bursts, which stalls the decode GPU per-burst
+        # (_prepare_disagg_gen_init / merge / RPC storm). Disabling it removes
+        # the transfer-buffer bound, so it can regress if transfers overrun.
+        if os.getenv("TRTLLM_DISABLE_DISAGG_GEN_ADMISSION", "0") == "1":
+            self.max_transfer_blocks = None
 
     def enabled(self) -> bool:
         return self.max_transfer_blocks is not None
