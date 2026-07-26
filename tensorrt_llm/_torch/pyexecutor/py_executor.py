@@ -7136,3 +7136,83 @@ class DisaggPPTerminationHandler:
             if req:
                 self._terminator_func(req)
         self._terminating_iteration += 1
+
+
+# ---------------------------------------------------------------------------
+# Optional NVTX instrumentation for the executor loop.
+#
+# Motivation: in nsys captures of a disaggregated context server the GPU sat
+# idle 36-44% of wall in gaps up to 397 ms, and NOT ONE of those gaps fell
+# inside an existing NVTX range, so the time had to be attributed by CPU
+# sampling -- which left 45-57% of samples unresolved on aarch64. These markers
+# name the loop phases and the MPI collectives directly.
+#
+# A collective's marked duration is dominated by rank-arrival skew rather than
+# payload, so read `exec::COLL::*` as "how long this rank waited for its peers".
+#
+# Off by default; this adds ~15 host-side range push/pop per iteration, so
+# enable it only on a tracing run, never on one that reports throughput.
+#   TLLM_NVTX_EXECUTOR_PHASES=1
+# ---------------------------------------------------------------------------
+def _install_executor_nvtx_markers():
+    import os
+    if os.environ.get("TLLM_NVTX_EXECUTOR_PHASES", "0") != "1":
+        return
+    try:
+        import torch
+        nvtx = torch.cuda.nvtx
+    except Exception:
+        return
+
+    def _wrap(cls, name, label):
+        fn = getattr(cls, name, None)
+        if fn is None or getattr(fn, "_nvtx_marked", False):
+            return False
+
+        def wrapper(*args, **kwargs):
+            nvtx.range_push(label)
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                # pop in finally, or a raising callee desynchronizes the stack
+                nvtx.range_pop()
+
+        wrapper._nvtx_marked = True
+        setattr(cls, name, wrapper)
+        return True
+
+    phases = (
+        "_fetch_new_requests",
+        "_schedule",
+        "_can_queue",
+        "_check_disagg_transfer_progress_when_idle",
+        "_check_disagg_ctx_cache_transfer_status",
+        "_check_disagg_gen_cache_transfer_status",
+        "_pad_attention_dp_dummy_request",
+        "_prepare_disagg_gen_transmission_complete",
+        "_update_requests",
+        "_handle_responses",
+        "_terminate_requests",
+    )
+    marked = [p for p in phases if _wrap(PyExecutor, p, f"exec::{p}")]
+
+    collectives = ("tp_allgather", "tp_allreduce", "allgather", "allreduce",
+                   "tp_gather", "broadcast")
+    coll = []
+    try:
+        from tensorrt_llm._torch.distributed import communicator as _comm
+        for cname in ("MPIDist", "TorchDist"):
+            cls = getattr(_comm, cname, None)
+            if cls is None:
+                continue
+            for m in collectives:
+                if _wrap(cls, m, f"exec::COLL::{cname}.{m}"):
+                    coll.append(f"{cname}.{m}")
+    except Exception as exc:
+        logger.warning(f"NVTX collective marking skipped: {exc}")
+
+    logger.info(f"NVTX executor markers enabled: {len(marked)} phases, "
+                f"{len(coll)} collectives")
+
+
+_install_executor_nvtx_markers()
