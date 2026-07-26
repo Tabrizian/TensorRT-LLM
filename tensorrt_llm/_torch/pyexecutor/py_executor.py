@@ -3266,12 +3266,30 @@ class PyExecutor:
         # can_queue_this_rank is for case that the batch is not empty on this rank, but empty on other ranks
         # For bs == 1, we cannot pad dummy request to make the batch non-empty since it will cause the batch size to be 2.
         # 1 for dummy request, 1 for the yet-to-complete but not-yet-updated request.
-        if self.enable_attention_dp:
-            tp_batch_sizes = self.dist.tp_allgather(scheduled_batch.batch_size)
-            can_queue = 0 not in tp_batch_sizes
-            can_queue_this_rank = scheduled_batch.batch_size > 0
-        else:
-            can_queue = can_queue_this_rank = scheduled_batch.batch_size > 0
+        #
+        # The attention-DP path used to run a tp_allgather here every iteration
+        # and take can_queue = 0 not in tp_batch_sizes. That collective cannot
+        # change the answer once _pad_attention_dp_dummy_request is in play: it
+        # guarantees every ADP rank holds at least one active request, and its
+        # only bypass (_should_skip_dummy_for_benchmark_disagg) requires the
+        # TLLM_BENCHMARK_REQ_QUEUES_SIZE fill phase. Measured on a 9-ctx GLM-5.2
+        # disagg run with that fill phase unused: "Skipped adding dummy
+        # requests" logged 0 times and 0 of 1095 rank-0 context iterations had
+        # an empty batch, i.e. the allgather returned True every time.
+        #
+        # What it did cost is a per-iteration barrier worth
+        # max(rank arrival) - min(rank arrival). In an nsys capture of that run
+        # the context GPU was idle 36-44% of wall in gaps up to 397 ms, and the
+        # submit thread's samples inside those gaps were dominated by MPI
+        # collective wait (mca_pml_ucx_recv <- PMPI_Recv <- mpi4py
+        # Comm.allreduce / PMPI_Allgather) over the intra-node shared-memory
+        # transport -- the ADP ranks of one instance waiting on each other.
+        #
+        # NOTE: this makes the decision rank-local, so it relies on dummy
+        # padding holding. If padding ever fails to keep a rank non-empty, ranks
+        # will disagree about running the forward pass and the model's own
+        # collectives will hang rather than raise.
+        can_queue = can_queue_this_rank = scheduled_batch.batch_size > 0
 
         return can_queue, can_queue_this_rank
 
