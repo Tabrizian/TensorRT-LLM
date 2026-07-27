@@ -15,8 +15,11 @@
 
 # yapf: disable
 import asyncio
+import os
 import signal
 import socket
+import threading
+import time
 import traceback
 from contextlib import asynccontextmanager
 from typing import Callable, Optional
@@ -100,6 +103,57 @@ class RawRequestResponseHooks(ResponseHooks):
             task.add_done_callback(background_tasks.discard)
 
 
+def _summarize_router_load(router) -> "list[tuple[str, int]]":
+    """[(server, outstanding)] for one router, busiest first.
+
+    ServerState._num_active_requests is incremented on dispatch and decremented
+    on completion, so this is requests OUTSTANDING at that server -- queued
+    there plus executing there. The disagg server cannot see a worker's internal
+    queue split without asking it, so no finer breakdown is claimed here. Note
+    it also does not count requests still waiting in the router ahead of
+    dispatch.
+    """
+    out = []
+    state = getattr(router, "_server_state", None)
+    if not isinstance(state, dict):
+        return out
+    for url, server in list(state.items()):
+        n = getattr(server, "_num_active_requests", None)
+        if n is None:
+            continue
+        out.append((str(url).split("//")[-1], int(n)))
+    out.sort(key=lambda item: -item[1])
+    return out
+
+
+def _format_router_load(rows) -> str:
+    if not rows:
+        return "none"
+    body = " ".join(f"{server}={n}" for server, n in rows)
+    return f"total={sum(n for _, n in rows)} [{body}]"
+
+
+def _disagg_load_reporter(server, interval: float) -> None:
+    """Log per-server in-flight counts every `interval` seconds.
+
+    Read-only: it touches state the routers already maintain, takes no locks and
+    does no work on the request path. Exceptions are swallowed so a reporting
+    problem can never take the server down.
+    """
+    while True:
+        try:
+            time.sleep(interval)
+            ctx = _summarize_router_load(getattr(server, "_ctx_router", None))
+            gen = _summarize_router_load(getattr(server, "_gen_router", None))
+            inflight = sum(n for _, n in ctx) + sum(n for _, n in gen)
+            logger.info(f"[disagg-load] inflight={inflight} | "
+                        f"CTX {_format_router_load(ctx)} | "
+                        f"GEN {_format_router_load(gen)}")
+        except Exception as exc:  # never take down the server
+            logger.warning(f"[disagg-load] reporter error: {exc}")
+            time.sleep(interval)
+
+
 class OpenAIDisaggServer:
     def __init__(self,
                  config: DisaggServerConfig,
@@ -145,6 +199,20 @@ class OpenAIDisaggServer:
                 server_start_timeout_secs=self._server_start_timeout_secs)
         self._ctx_router = self._coordinator.ctx_router
         self._gen_router = self._coordinator.gen_router
+
+        # Optional per-server load reporting. Off unless an interval is set;
+        # this is how ctx-vs-gen queue depth was attributed during GLM-5.2
+        # disagg tuning (e.g. showing 41% of in-flight requests parked in ctx
+        # at 8 context servers).
+        _load_interval = float(
+            os.environ.get("TRTLLM_DISAGG_LOAD_LOG_SECS", "0") or 0)
+        if _load_interval > 0:
+            threading.Thread(target=_disagg_load_reporter,
+                             args=(self, _load_interval),
+                             name="disagg-load-reporter",
+                             daemon=True).start()
+            logger.info(
+                f"[disagg-load] reporting every {_load_interval:g}s")
 
         self._service = OpenAIDisaggregatedService(
             self._config, self._coordinator, self._create_client,
