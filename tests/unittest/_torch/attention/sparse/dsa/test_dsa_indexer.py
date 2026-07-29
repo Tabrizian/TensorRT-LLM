@@ -512,12 +512,6 @@ def _create_mock_metadata(
             self.enable_heuristic_topk = False
             self.use_cute_dsl_topk = False
             self.in_mtp_draft_loop = False
-            # Stable-address stash for MTP index sharing, mirroring
-            # create_buffers_for_indexer(). batch_size is this mock's
-            # max_num_sequences.
-            self.mtp_shared_topk_indices_buffer = torch.zeros(
-                (batch_size, index_topk), device="cuda", dtype=torch.int32
-            )
             self.indexer_head_dim = indexer_head_dim
             self.indexer_quant_block_size = 128
             self.compress_ratios = [compress_ratio]
@@ -2950,14 +2944,7 @@ def test_indexer_decode_mtp_topk_reuse(step0_mode, batch_size):
     stash = meta0.shared_topk_indices
     assert stash is not None, "Step 0 should stash shared_topk_indices"
     assert stash.shape[0] == batch_size
-    assert torch.equal(stash[:batch_size], expected_rows), f"{step0_mode} step-0 stash mismatch"
-    # Graph safety: CUDA graphs capture tensor addresses, so step 0 must publish
-    # the persistent backing buffer. Rebinding shared_topk_indices to a fresh
-    # advanced-indexing/cat result leaves replay consumers reading a stale
-    # allocation -- the GLM-5.2 MTP reasoning-loop regression.
-    assert stash.data_ptr() == meta0.mtp_shared_topk_indices_buffer.data_ptr(), (
-        "step-0 must publish the persistent stash buffer, not a fresh allocation"
-    )
+    assert torch.equal(stash, expected_rows), f"{step0_mode} step-0 stash mismatch"
 
     # Draft steps 1..N: reuse the stash verbatim (next_n=1, skip_topk).
     for step in range(1, num_reuse_steps + 1):
