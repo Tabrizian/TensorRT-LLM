@@ -600,6 +600,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     # Cross-layer indexer sharing: previous full layer's top-k, reused by
     # "shared" layers (None for a dense per-layer indexer).
     shared_topk_indices: Optional[torch.Tensor] = None
+    # Stable-address backing storage for MTP index sharing. CUDA graphs capture
+    # tensor addresses, so the draft loop must copy compacted rows into this
+    # buffer instead of rebinding shared_topk_indices to a fresh allocation.
+    mtp_shared_topk_indices_buffer: Optional[torch.Tensor] = None
     # Whether skip the indexer for context requests
     skip_indexer_for_ctx_reqs: bool = False
     # Whether skip the indexer for generation requests
@@ -1040,6 +1044,18 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         )
         self.host_req_idx_per_token = torch.empty_like(
             self.req_idx_per_token, device='cpu', pin_memory=prefer_pinned())
+        # MTP index sharing compacts one Top-K row per request after draft step
+        # zero. Keep the destination address stable across graph capture/replay;
+        # assigning a newly allocated advanced-indexing result to
+        # shared_topk_indices would leave replay consumers captured against a
+        # stale allocation.
+        self.mtp_shared_topk_indices_buffer = self.get_empty(
+            self.cuda_graph_buffers,
+            (self.max_num_sequences, self.num_sparse_topk),
+            cache_name="mtp_shared_topk_indices_buffer",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
         # Block table for topk_indices conversion (shared for context and generation)
         self.block_table = self.get_empty(
             self.cuda_graph_buffers,
@@ -2896,7 +2912,18 @@ class Indexer(nn.Module):
         if (self.mtp_index_share
                 and getattr(metadata, "in_mtp_draft_loop", False)
                 and not reuse_topk):
-            rows = None
+            stash = metadata.mtp_shared_topk_indices_buffer
+            assert stash is not None
+            wrote_rows = False
+            # Context rows first, then generation rows: draft steps >= 1 flatten
+            # every request to one query token, so the reuse branch's
+            # ``[:num_generations]`` slice sees this same [ctx..., gen...] order.
+            if num_contexts > 0:
+                ctx_last = torch.cumsum(
+                    metadata.seq_lens_cuda[:num_contexts].to(
+                        torch.long), dim=0) - 1
+                stash[:num_contexts].copy_(topk_indices_buffer[ctx_last])
+                wrote_rows = True
             if num_generations > 0:
                 next_n = num_gen_tokens // num_generations
                 gen_block = topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
@@ -2915,17 +2942,17 @@ class Indexer(nn.Module):
                     acc_gen = mtp_num_accepted[num_contexts:num_contexts +
                                                num_generations].to(torch.long)
                     sel = base + (acc_gen - 1).clamp_(min=0, max=next_n - 1)
-                    rows = gen_block[sel]
+                    gen_rows = gen_block[sel]
                 else:
-                    rows = gen_block[next_n - 1::next_n]
-            if num_contexts > 0:
-                ctx_last = torch.cumsum(
-                    metadata.seq_lens_cuda[:num_contexts].to(
-                        torch.long), dim=0) - 1
-                ctx_rows = topk_indices_buffer[ctx_last]
-                rows = ctx_rows if rows is None else torch.cat([ctx_rows, rows])
-            if rows is not None:
-                metadata.shared_topk_indices = rows.contiguous()
+                    gen_rows = gen_block[next_n - 1::next_n]
+                stash[num_contexts:num_contexts +
+                      num_generations].copy_(gen_rows)
+                wrote_rows = True
+            if wrote_rows:
+                # Publish the persistent backing tensor, never an ephemeral
+                # advanced-indexing/cat result. Reuse reads only the live
+                # request prefix.
+                metadata.shared_topk_indices = stash
         return topk_indices_buffer
 
     def _weight_scale(self, weights: torch.Tensor,
