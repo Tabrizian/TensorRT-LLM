@@ -152,6 +152,29 @@ _SLEEP_WAKEUP_LISTENER_JOIN_TIMEOUT_S = 30.0
 _SLEEP_WAKEUP_ACK_TIMEOUT_S = 30.0
 _SLEEP_WAKEUP_ACK_POLL_INTERVAL_S = 0.01
 
+# ---------------------------------------------------------------------------
+# A/B experiment toggles (this branch only; not for upstream).
+#
+# Both default to the behavior this branch already shipped, so an unset
+# environment reproduces the existing feat/glm52 arm exactly.
+#
+#   TRTLLM_AB_IDLE_REAP=1
+#       _check_disagg_transfer_progress_when_idle performs the two
+#       non-blocking transfer-status polls (ctx + gen, atLeastNum=0) instead of
+#       returning immediately. No collectives and no blocking waits -- this is
+#       the behavior proposed in TensorRT-LLM PR #17324. Unset reproduces the
+#       current branch behavior, which reaps nothing here.
+#
+#   TRTLLM_AB_ADMISSION=1
+#       _apply_disagg_transfer_admission runs the real FCFS admission
+#       controller. Unset keeps the passthrough this branch introduced.
+#
+# Read once at import: the harness exports these before the worker starts, and
+# reading them per iteration would add cost to the very loop under measurement.
+# ---------------------------------------------------------------------------
+_AB_IDLE_REAP = os.getenv("TRTLLM_AB_IDLE_REAP") == "1"
+_AB_ADMISSION = os.getenv("TRTLLM_AB_ADMISSION") == "1"
+
 
 def _sleep_wakeup_ack_ready(comm, source: int, tag: _SleepWakeupTag) -> bool:
     """Return whether an ACK is ready without blocking on recv."""
@@ -3397,12 +3420,12 @@ class PyExecutor:
     def _apply_disagg_transfer_admission(
         self, fitting_disagg_gen_init_requests: List[LlmRequest]
     ) -> Tuple[List[LlmRequest], bool]:
-        # Disabled: the controller deferred gen-init requests to bound the
-        # number of in-flight KV transfer blocks. Its FCFS deferral bursts
-        # admissions and was measured costing ~18% of GEN GPU-idle time. With
-        # the idle check above also removed there is no transfer budget left to
-        # wait on, so admit every fitting request and never report "blocked".
-        return fitting_disagg_gen_init_requests, False
+        # Disabled by default: the controller deferred gen-init requests to
+        # bound the number of in-flight KV transfer blocks. Its FCFS deferral
+        # bursts admissions and was measured costing ~18% of GEN GPU-idle time.
+        # A/B arm: TRTLLM_AB_ADMISSION=1 restores the real controller below.
+        if not _AB_ADMISSION:
+            return fitting_disagg_gen_init_requests, False
 
         # gen_only_no_context has no CTX worker and does not transfer data.
         # Real synchronous gen_only transfers still honor the budget to bound
@@ -3511,6 +3534,22 @@ class PyExecutor:
         # method are dropped. Both replacements are rank-uniform and contain no
         # collectives, so ranks cannot diverge -- the deadlock the voting
         # guarded against cannot arise once nothing here is conditional.
+        #
+        # A/B arm: TRTLLM_AB_IDLE_REAP=1 selects the PR #17324 middle ground --
+        # keep reaping completed transfers here (so their KV blocks are freed
+        # promptly) but with the non-blocking atLeastNum=0 form and no vote.
+        # Both status calls run their own internal consensus and every rank
+        # enters them unconditionally, so this stays rank-uniform.
+        if _AB_IDLE_REAP:
+            # A synchronous GEN receive is rank-local and blocking, so one rank
+            # can still be receiving while another is idle; entering either
+            # progress collective is unsafe in that mode.
+            if not self._uses_async_disagg_gen_transfer():
+                return
+            self._check_disagg_ctx_cache_transfer_status(0)
+            self._check_disagg_gen_cache_transfer_status(0)
+            return
+
         return
 
         local_need_check = (num_fitting_reqs == 0
