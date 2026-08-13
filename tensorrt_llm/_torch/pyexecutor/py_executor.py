@@ -506,6 +506,9 @@ class PyExecutor:
     # 1024 in-flight micro batches can avoid synchronization in most cases and keep host memory usage low.
     MIN_ASYNC_MICRO_BATCH_NUM = 1024
 
+    # One-shot guard for the TRTLLM_DISAGG_IDLE_CHECK arm marker.
+    _disagg_idle_check_arm_logged = False
+
     def __init__(
             self,
             resource_manager,
@@ -3387,6 +3390,27 @@ class PyExecutor:
         return (not self._is_disagg_gen_only_no_context_benchmark() and
                 os.getenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP") != "1")
 
+    @staticmethod
+    def _uses_legacy_disagg_idle_check() -> bool:
+        """Return whether the idle progress check keeps its rank-vote collectives.
+
+        A/B switch so both arms of the PR #17324 measurement come from ONE
+        image. Unset -- the default -- is this branch's shipped behaviour, the
+        simplified non-blocking reap. ``legacy`` falls through to the pre-PR
+        body, which gates the reap behind a WORLD allreduce plus a TP/CP vote.
+
+        The arm is logged once per rank. An env-var A/B whose variable silently
+        failed to reach the workers is indistinguishable from a null result, so
+        grep every rank for the marker before believing any number.
+        """
+        legacy = os.getenv("TRTLLM_DISAGG_IDLE_CHECK", "").lower() == "legacy"
+        if not PyExecutor._disagg_idle_check_arm_logged:
+            PyExecutor._disagg_idle_check_arm_logged = True
+            logger.info("AB_MARKER disagg_idle_check=%s (PR17324 %s)",
+                        "legacy" if legacy else "simplified",
+                        "OFF" if legacy else "ON")
+        return legacy
+
     def _uses_kv_manager_v2(self) -> bool:
         explicit_flag = getattr(self, "_is_kv_manager_v2", None)
         if explicit_flag is not None:
@@ -3528,14 +3552,19 @@ class PyExecutor:
         # the collectives this commit's parent removed for perf, while
         # restoring the forward-progress property it accidentally removed.
         # Upstream equivalent: PR #17324.
-        if not self._uses_async_disagg_gen_transfer():
-            # A synchronous GEN receive is rank-local and blocking, so one rank
-            # can still be receiving while another is idle; entering either
-            # progress collective is unsafe in that mode.
+        #
+        # TRTLLM_DISAGG_IDLE_CHECK=legacy falls through to the pre-PR body
+        # below instead, so a single image can measure both arms. The default
+        # path is unchanged from this commit, byte for byte.
+        if not self._uses_legacy_disagg_idle_check():
+            if not self._uses_async_disagg_gen_transfer():
+                # A synchronous GEN receive is rank-local and blocking, so one
+                # rank can still be receiving while another is idle; entering
+                # either progress collective is unsafe in that mode.
+                return
+            self._check_disagg_ctx_cache_transfer_status(0)
+            self._check_disagg_gen_cache_transfer_status(0)
             return
-        self._check_disagg_ctx_cache_transfer_status(0)
-        self._check_disagg_gen_cache_transfer_status(0)
-        return
 
         local_need_check = (num_fitting_reqs == 0
                             and not fitting_disagg_gen_init_requests)
