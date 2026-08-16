@@ -3391,6 +3391,26 @@ class PyExecutor:
                 os.getenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP") != "1")
 
     @staticmethod
+    def _skips_idle_gen_transfer_poll() -> bool:
+        """Return whether the idle check omits the redundant GEN transfer poll.
+
+        This is PR #17324's FINAL behaviour, which this branch does not have:
+        the branch polls BOTH ctx and gen status in the idle check, while the
+        PR polls only ctx. Per the PR, the gen poll is redundant -- the loop
+        head already ran `_check_disagg_gen_transfer_status` this iteration and
+        any receive started since is polled by `_recv_disagg_gen_cache` -- so
+        "a poll here would only repeat the GEN status call and its consensus".
+
+        That consensus is a collective, and at batch 1 a collective is pure
+        latency with no work to amortise it. An nsys capture of 60 real decode
+        iterations on pareto01 measured
+        `_check_disagg_gen_cache_transfer_status` at 120 calls / 692.5 ms --
+        TWO calls and 11.5 ms per iteration, against a ~13.5 ms iteration.
+        Every other range in the loop totalled under 1 ms.
+        """
+        return os.getenv("TRTLLM_DISAGG_IDLE_CHECK", "").lower() == "pr17324"
+
+    @staticmethod
     def _uses_legacy_disagg_idle_check() -> bool:
         """Return whether the idle progress check keeps its rank-vote collectives.
 
@@ -3403,11 +3423,12 @@ class PyExecutor:
         failed to reach the workers is indistinguishable from a null result, so
         grep every rank for the marker before believing any number.
         """
-        legacy = os.getenv("TRTLLM_DISAGG_IDLE_CHECK", "").lower() == "legacy"
+        mode = os.getenv("TRTLLM_DISAGG_IDLE_CHECK", "").lower()
+        legacy = mode == "legacy"
         if not PyExecutor._disagg_idle_check_arm_logged:
             PyExecutor._disagg_idle_check_arm_logged = True
             logger.info("AB_MARKER disagg_idle_check=%s (PR17324 %s)",
-                        "legacy" if legacy else "simplified",
+                        mode or "simplified",
                         "OFF" if legacy else "ON")
         return legacy
 
@@ -3563,7 +3584,8 @@ class PyExecutor:
                 # either progress collective is unsafe in that mode.
                 return
             self._check_disagg_ctx_cache_transfer_status(0)
-            self._check_disagg_gen_cache_transfer_status(0)
+            if not self._skips_idle_gen_transfer_poll():
+                self._check_disagg_gen_cache_transfer_status(0)
             return
 
         local_need_check = (num_fitting_reqs == 0
