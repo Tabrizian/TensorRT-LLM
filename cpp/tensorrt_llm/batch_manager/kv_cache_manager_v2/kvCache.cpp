@@ -2103,12 +2103,24 @@ void KvCache::_setupForReuse(BlockRadixTree::ReuseMatch const& match)
             auto& bpSlot = mBlocks[ordinal].pages[beamIdx][lcId];
             bpSlot = page->hold();
             // A reusing request with a higher priority promotes the block (a conversation's
-            // second turn lifts its first-turn blocks out of the low bucket). Held pages are
-            // out of the eviction queues, so the new priority takes effect on release.
+            // second turn lifts its first-turn blocks out of the low bucket). A held page at a
+            // non-last level is STILL evictable (it may be demoted to the host tier), so it can be
+            // sitting in an eviction queue keyed by its old priority: re-bucket it, never mutate
+            // the priority of a queued page in place.
             Priority const reusePriority = getPriority(ordinal, lcId);
             if (reusePriority > page->priority)
             {
+                auto* const storageMgr = page->manager;
+                bool const queued = page->scheduledForEviction();
+                if (queued)
+                {
+                    storageMgr->excludeFromEviction(*page);
+                }
                 page->priority = reusePriority;
+                if (queued)
+                {
+                    storageMgr->scheduleForEviction(*page);
+                }
             }
             if (shouldRecordStats && isAttention)
             {
