@@ -67,6 +67,12 @@ public:
     // Remove an arbitrary page via its iterator. O(1).
     SharedPtr<Page> remove(NodeRef node);
 
+    // Least-recently-used page (front of the queue). Queue must be non-empty.
+    SharedPtr<Page> const& front() const
+    {
+        return mQueue.front();
+    }
+
     size_t size() const noexcept
     {
         return mQueue.size();
@@ -100,7 +106,15 @@ class PrioritizedEvictionPolicy
 {
 public:
     NodeRef push(SharedPtr<Page> page, bool evictFirst = false);
+    // Evict the lowest-priority, least-recently-used page. With a priority lapse window
+    // configured (env TLLM_KV_PRIORITY_LAPSE_S > 0), a page whose priority is ABOVE the
+    // default and that has sat evictable for longer than the window counts as default
+    // priority: protection is a lease, not a permanent rank. Conversation KV that was
+    // protected because the session was live thus becomes ordinary LRU once the session
+    // has been silent for the window. Pages at or below default priority are unaffected.
     SharedPtr<Page> pop();
+    // Seconds of the lapse window; 0 = disabled (stock behaviour).
+    static double lapseWindowSeconds();
     SharedPtr<Page> remove(NodeRef node);
 
     SlotCount size() const noexcept;

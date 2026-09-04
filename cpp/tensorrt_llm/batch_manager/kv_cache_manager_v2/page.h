@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include <chrono>
+
 #include "kv_cache_manager_v2/blockRadixTree.h"
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/evictionController.h"
@@ -53,6 +55,9 @@ public:
     Priority priority;
     WeakPtr<PageHolder> holder;     // empty → DROPPABLE
     std::optional<NodeRef> nodeRef; // present → scheduled for eviction
+    // When the page last entered an eviction queue (= when its last holder released it).
+    // Used by the priority-lapse rule in PrioritizedEvictionPolicy::pop().
+    std::chrono::steady_clock::time_point evictScheduledAt{};
 
     Page(StorageManager* mgr, LifeCycleId lc, CacheLevel level, Priority prio);
 

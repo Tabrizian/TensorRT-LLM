@@ -21,10 +21,13 @@
 #include "kv_cache_manager_v2/page.h"
 
 #include "tensorrt_llm/common/assert.h"
+#include <chrono>
 #include <cstddef>
+#include <cstdlib>
 #include <numeric>
 #include <set>
 #include <stdexcept>
+#include <string>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -83,11 +86,71 @@ NodeRef PrioritizedEvictionPolicy::push(SharedPtr<Page> page, bool evictFirst)
     return policy.push(std::move(page), evictFirst);
 }
 
+double PrioritizedEvictionPolicy::lapseWindowSeconds()
+{
+    static double const window = []
+    {
+        char const* env = std::getenv("TLLM_KV_PRIORITY_LAPSE_S");
+        if (env == nullptr || *env == '\0')
+        {
+            return 0.0;
+        }
+        try
+        {
+            double const v = std::stod(env);
+            return v > 0.0 ? v : 0.0;
+        }
+        catch (...)
+        {
+            return 0.0;
+        }
+    }();
+    return window;
+}
+
 SharedPtr<Page> PrioritizedEvictionPolicy::pop()
 {
     TLLM_CHECK_DEBUG(!mPolicies.empty());
-    // Lowest priority key evicted first (std::map iterates in ascending key order)
+    double const lapse = lapseWindowSeconds();
     auto it = mPolicies.begin();
+    if (lapse > 0.0 && mPolicies.size() > 1)
+    {
+        // Pick, across the LRU head of every bucket, the page with the lowest EFFECTIVE
+        // priority; ties go to the oldest. Within a bucket the head is the oldest page,
+        // so heads are the only candidates.
+        auto const now = std::chrono::steady_clock::now();
+        auto best = mPolicies.end();
+        Priority bestEff = kPriorityMax + 1;
+        std::chrono::steady_clock::time_point bestAt{};
+        for (auto cur = mPolicies.begin(); cur != mPolicies.end(); ++cur)
+        {
+            if (cur->second.empty())
+            {
+                continue;
+            }
+            auto const& head = cur->second.front();
+            Priority eff = cur->first;
+            if (eff > kPriorityDefault && std::chrono::duration<double>(now - head->evictScheduledAt).count() > lapse)
+            {
+                eff = kPriorityDefault;
+            }
+            if (best == mPolicies.end() || eff < bestEff || (eff == bestEff && head->evictScheduledAt < bestAt))
+            {
+                best = cur;
+                bestEff = eff;
+                bestAt = head->evictScheduledAt;
+            }
+            if (eff < kPriorityDefault)
+            {
+                break; // buckets ascend: nothing later can beat a below-default head
+            }
+        }
+        if (best != mPolicies.end())
+        {
+            it = best;
+        }
+    }
+    // Lowest (effective) priority key evicted first (std::map iterates in ascending key order)
     auto page = it->second.pop();
     if (it->second.empty())
     {
@@ -162,6 +225,12 @@ void PerLevelEvictionController::scheduleForEviction(Page& page, bool evictFirst
     TLLM_CHECK_DEBUG(page.nodeRef == std::nullopt);
     TLLM_CHECK_DEBUG(page.cacheLevel == mCacheLevel);
     auto sharedPage = page.sharedFromThis();
+    if (!evictFirst)
+    {
+        // A fresh release: the page's idle clock starts now. Rollback re-queues
+        // (evictFirst) keep the original timestamp.
+        page.evictScheduledAt = std::chrono::steady_clock::now();
+    }
     NodeRef ref = getPolicy(page.lifeCycle).push(sharedPage, evictFirst);
     page.nodeRef = ref;
     TLLM_CHECK_DEBUG_WITH_INFO(*ref == sharedPage, "stored iterator must dereference to this page");

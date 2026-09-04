@@ -2556,6 +2556,7 @@ class KVCacheManagerV2(BaseResourceManager):
                         req.total_input_len_cp if self._has_cp_helix else req.prompt_len
                     )
                     - 1,
+                    priority=None if req.is_dummy else self._conversation_priority(req),
                 )
                 if kv_cache is None:
                     return False
@@ -4056,6 +4057,34 @@ class KVCacheManagerV2(BaseResourceManager):
         digest = hashlib.sha256(cache_salt.encode("utf-8")).digest()
         return int.from_bytes(digest[:8], "little")
 
+    # Conversation-aware KV retention priority (opt-in via TLLM_KV_CONV_PRIORITY=1).
+    # Measured on GLM 5.2 AgentX (pareto07): only 47% of conversations send a second
+    # turn, 90%+ of those with 2+ turns keep going; dead sessions held ~1/3 of the
+    # resident KV under plain LRU. First turn -> low priority (evicted first, and with
+    # secondary_offload_min_priority never offloaded); later turns -> protected. The
+    # protection lapses after TLLM_KV_PRIORITY_LAPSE_S of silence (see
+    # PrioritizedEvictionPolicy::pop). The reuse path promotes first-turn blocks when
+    # the second turn arrives.
+    _CONV_PRIORITY_ENABLED = os.environ.get("TLLM_KV_CONV_PRIORITY", "").strip() == "1"
+    _CONV_PRIORITY_FIRST = int(os.environ.get("TLLM_KV_CONV_PRIORITY_FIRST", "25"))
+    _CONV_PRIORITY_RETURN = int(os.environ.get("TLLM_KV_CONV_PRIORITY_RETURN", "60"))
+    _CONV_PRIORITY_MAX_SESSIONS = 65536
+
+    def _conversation_priority(self, request: LlmRequest) -> Optional[int]:
+        """Priority for this request's committed blocks from its conversation's turn count
+        as seen by THIS rank (conversations are pinned to a rank). None = default."""
+        if not self._CONV_PRIORITY_ENABLED or self.is_draft:
+            return None
+        conversation_id = _request_conversation_id(request)
+        if conversation_id is None:
+            return None
+        turns = self.__dict__.setdefault("_conv_turns", OrderedDict())
+        count = turns.pop(conversation_id, 0) + 1
+        turns[conversation_id] = count
+        while len(turns) > self._CONV_PRIORITY_MAX_SESSIONS:
+            turns.popitem(last=False)
+        return self._CONV_PRIORITY_FIRST if count == 1 else self._CONV_PRIORITY_RETURN
+
     def _create_kv_cache(
         self,
         request_id: int,
@@ -4066,6 +4095,7 @@ class KVCacheManagerV2(BaseResourceManager):
         is_dummy: bool = False,
         enable_request_stats: bool = False,
         expected_prompt_length: int | None = None,
+        priority: int | None = None,
     ):
         assert request_id not in self.kv_cache_map, (
             f"KV cache for request {request_id} already exists"
@@ -4082,12 +4112,17 @@ class KVCacheManagerV2(BaseResourceManager):
             return None
         salt_int = self._derive_reuse_salt(cache_salt)
         enable_request_stats = enable_request_stats and not is_dummy and not self.is_draft
+        create_kwargs = {}
+        if priority is not None:
+            prio = int(priority)
+            create_kwargs["custom_priority_callback"] = lambda _ordinal, _life_cycle: prio
         kv_cache = self.impl.create_kv_cache(
             ReuseScope(lora_id=lora_task_id, salt=salt_int),
             input_tokens,
             id=request_id,
             enable_request_stats=enable_request_stats,
             expected_prompt_length=expected_prompt_length,
+            **create_kwargs,
         )
         self.kv_cache_map[request_id] = kv_cache
         if enable_request_stats and not self.enable_stats:

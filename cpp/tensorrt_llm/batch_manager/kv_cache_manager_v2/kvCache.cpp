@@ -2102,6 +2102,14 @@ void KvCache::_setupForReuse(BlockRadixTree::ReuseMatch const& match)
             TLLM_CHECK_DEBUG_WITH_INFO(page, "Expected page in non-stale block");
             auto& bpSlot = mBlocks[ordinal].pages[beamIdx][lcId];
             bpSlot = page->hold();
+            // A reusing request with a higher priority promotes the block (a conversation's
+            // second turn lifts its first-turn blocks out of the low bucket). Held pages are
+            // out of the eviction queues, so the new priority takes effect on release.
+            Priority const reusePriority = getPriority(ordinal, lcId);
+            if (reusePriority > page->priority)
+            {
+                page->priority = reusePriority;
+            }
             if (shouldRecordStats && isAttention)
             {
                 if (ordinal < fullReusedEnd)
