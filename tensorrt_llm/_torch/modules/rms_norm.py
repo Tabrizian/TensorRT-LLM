@@ -107,6 +107,13 @@ class RMSNorm(nn.Module):
         # attaches it afterwards (DeepseekV3 post_load_weights /
         # MLA._resolve_qa_fused_scale). None keeps the fusion disabled.
         self.nvfp4_scale: Optional[torch.Tensor] = None
+        # When True the fused path emits the NVFP4 scale factors in the plain
+        # row-major ([m, k/16]) layout instead of the GEMM-swizzled one, and the
+        # returned Fp4QuantizedTensor is marked is_sf_swizzled=False. Needed
+        # when the consumer is a MoE whose dispatch (post-quant all-to-all /
+        # allgather) requires the linear layout. Only the reduce_fusion kernels
+        # support it, so the warp-specialized kernel is bypassed.
+        self.nvfp4_sf_linear: bool = False
 
     def forward(
         self,
@@ -260,7 +267,8 @@ class RMSNorm(nn.Module):
         # Either flag means "also produce the BF16 normed value".
         want_norm = return_norm_out or self.return_hp_output
 
-        if self._ws_kernel_eligible(hidden_states, residual):
+        sf_linear = self.nvfp4_sf_linear
+        if not sf_linear and self._ws_kernel_eligible(hidden_states, residual):
             return self._fused_nvfp4_quant_ws(hidden_states, residual, sf_scale,
                                               return_norm_out)
 
@@ -272,6 +280,7 @@ class RMSNorm(nn.Module):
                 sf_scale,
                 float(self.variance_epsilon),
                 want_norm,
+                sf_linear,
             )
             if want_norm:
                 bf16_hs, act_fp4, act_sf, residual_out = results
@@ -280,6 +289,7 @@ class RMSNorm(nn.Module):
                 bf16_hs = None
             fp4 = Fp4QuantizedTensor(act_fp4,
                                      act_sf,
+                                     is_sf_swizzled=not sf_linear,
                                      unquantized_hidden_states=bf16_hs)
             outputs = [fp4, residual_out]
             if self.return_hp_output:
@@ -295,6 +305,7 @@ class RMSNorm(nn.Module):
             sf_scale,
             float(self.variance_epsilon),
             want_norm,
+            sf_linear,
         )
         if want_norm:
             norm_out, act_fp4, act_sf = results
@@ -306,6 +317,7 @@ class RMSNorm(nn.Module):
             act_fp4 = act_fp4.reshape(*orig_shape[:-1], n // 2)
         fp4 = Fp4QuantizedTensor(act_fp4,
                                  act_sf,
+                                 is_sf_swizzled=not sf_linear,
                                  unquantized_hidden_states=norm_out)
         return (fp4, norm_out) if return_norm_out else fp4
 

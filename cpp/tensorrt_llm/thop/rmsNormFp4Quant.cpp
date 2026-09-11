@@ -49,7 +49,7 @@ namespace torch_ext
 // Returns: [quant_out, scale_out, residual_out] or
 //          [norm_out, quant_out, scale_out, residual_out] when return_norm_out.
 std::vector<at::Tensor> fused_add_rmsnorm_fp4_quantize(at::Tensor const& hidden_states, at::Tensor residual,
-    at::Tensor const& norm_weight, at::Tensor const& scale_factor, double eps, bool return_norm_out)
+    at::Tensor const& norm_weight, at::Tensor const& scale_factor, double eps, bool return_norm_out, bool sf_linear_layout)
 {
     CHECK_TH_CUDA(hidden_states);
     CHECK_CONTIGUOUS(hidden_states);
@@ -78,7 +78,12 @@ std::vector<at::Tensor> fused_add_rmsnorm_fp4_quantize(at::Tensor const& hidden_
     std::vector<int64_t> quant_shape(input_shape.begin(), input_shape.end());
     quant_shape[rank - 1] = k / 2;
     at::Tensor quant_out = at::detail::empty_cuda(quant_shape, FLOAT4_E2M1X2, hidden_states.device(), std::nullopt);
-    at::Tensor scale_out = at::detail::empty_cuda({tensorrt_llm::computeSwizzledLayoutSFSize(m, k / sf_vec_size)},
+    // sf_linear_layout: emit the per-16-block E4M3 scales row-major ([m, k/16])
+    // instead of the GEMM-swizzled layout, for consumers that need the plain
+    // layout (MoE post-quant all-to-all / allgather dispatch).
+    at::Tensor scale_out = at::detail::empty_cuda(
+        {sf_linear_layout ? tensorrt_llm::computeLinearLayoutSFSize(m, k / sf_vec_size)
+                          : tensorrt_llm::computeSwizzledLayoutSFSize(m, k / sf_vec_size)},
         SF_DTYPE, hidden_states.device(), std::nullopt);
 
     at::Tensor norm_out;
@@ -114,7 +119,8 @@ std::vector<at::Tensor> fused_add_rmsnorm_fp4_quantize(at::Tensor const& hidden_
     params.hidden_size = static_cast<int>(k);
     params.eps = static_cast<float>(eps);
     params.elts_total = hidden_states.numel();
-    params.sf_layout = tensorrt_llm::QuantizationSFLayout::SWIZZLED;
+    params.sf_layout = sf_linear_layout ? tensorrt_llm::QuantizationSFLayout::LINEAR
+                                        : tensorrt_llm::QuantizationSFLayout::SWIZZLED;
 
     auto const stream = at::cuda::getCurrentCUDAStream(hidden_states.get_device());
     auto const dtype = tensorrt_llm::runtime::TorchUtils::dataType(hidden_states.scalar_type());
@@ -147,7 +153,7 @@ std::vector<at::Tensor> fused_add_rmsnorm_fp4_quantize(at::Tensor const& hidden_
 // Returns: [quant_out, scale_out] or [norm_out, quant_out, scale_out] when
 //          return_norm_out.
 std::vector<at::Tensor> fused_rmsnorm_fp4_quantize(at::Tensor const& hidden_states, at::Tensor const& norm_weight,
-    at::Tensor const& scale_factor, double eps, bool return_norm_out)
+    at::Tensor const& scale_factor, double eps, bool return_norm_out, bool sf_linear_layout)
 {
     CHECK_TH_CUDA(hidden_states);
     CHECK_TH_CUDA(norm_weight);
@@ -189,7 +195,12 @@ std::vector<at::Tensor> fused_rmsnorm_fp4_quantize(at::Tensor const& hidden_stat
     std::vector<int64_t> quant_shape(input_shape.begin(), input_shape.end());
     quant_shape[rank - 1] = k / 2;
     at::Tensor quant_out = at::detail::empty_cuda(quant_shape, FLOAT4_E2M1X2, hidden_states.device(), std::nullopt);
-    at::Tensor scale_out = at::detail::empty_cuda({tensorrt_llm::computeSwizzledLayoutSFSize(m, k / sf_vec_size)},
+    // sf_linear_layout: emit the per-16-block E4M3 scales row-major ([m, k/16])
+    // instead of the GEMM-swizzled layout, for consumers that need the plain
+    // layout (MoE post-quant all-to-all / allgather dispatch).
+    at::Tensor scale_out = at::detail::empty_cuda(
+        {sf_linear_layout ? tensorrt_llm::computeLinearLayoutSFSize(m, k / sf_vec_size)
+                          : tensorrt_llm::computeSwizzledLayoutSFSize(m, k / sf_vec_size)},
         SF_DTYPE, hidden_states.device(), std::nullopt);
 
     at::Tensor norm_out;
@@ -219,7 +230,8 @@ std::vector<at::Tensor> fused_rmsnorm_fp4_quantize(at::Tensor const& hidden_stat
     params.hidden_size = static_cast<int>(k);
     params.eps = static_cast<float>(eps);
     params.elts_total = hidden_states.numel();
-    params.sf_layout = tensorrt_llm::QuantizationSFLayout::SWIZZLED;
+    params.sf_layout = sf_linear_layout ? tensorrt_llm::QuantizationSFLayout::LINEAR
+                                        : tensorrt_llm::QuantizationSFLayout::SWIZZLED;
     params.input_row_stride = input_row_stride;
 
     auto const stream = at::cuda::getCurrentCUDAStream(hidden_states.get_device());
@@ -247,14 +259,16 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor norm_weight,"
         "Tensor scale_factor,"
         "float eps,"
-        "bool return_norm_out) -> Tensor[]");
+        "bool return_norm_out,"
+        "bool sf_linear_layout=False) -> Tensor[]");
     m.def(
         "fused_rmsnorm_fp4_quantize("
         "Tensor hidden_states,"
         "Tensor norm_weight,"
         "Tensor scale_factor,"
         "float eps,"
-        "bool return_norm_out) -> Tensor[]");
+        "bool return_norm_out,"
+        "bool sf_linear_layout=False) -> Tensor[]");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

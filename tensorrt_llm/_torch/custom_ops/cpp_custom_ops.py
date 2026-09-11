@@ -1297,9 +1297,10 @@ def _register_fake():
         scale_factor: torch.Tensor,
         eps: float,
         return_norm_out: bool,
+        sf_linear_layout: bool = False,
     ) -> List[torch.Tensor]:
         # quant_out: packed NVFP4 (E2M1x2) as uint8, last dim halved, leading
-        # dims preserved. scale_out: swizzled E4M3 scale bytes. residual_out:
+        # dims preserved. scale_out: swizzled (or linear) E4M3 scale bytes. residual_out:
         # hidden+residual, a fresh tensor (the op does not mutate hidden_states).
         # When return_norm_out, the BF16 post-RMSNorm value leads the tuple.
         m = 1
@@ -1308,8 +1309,9 @@ def _register_fake():
         k = hidden_states.shape[-1]
         quant_shape = (*hidden_states.shape[:-1], k // 2)
         quant_out = hidden_states.new_empty(quant_shape, dtype=torch.uint8)
-        sf_out = hidden_states.new_empty((_swizzled_sf_size(m, k), ),
-                                         dtype=torch.uint8)
+        sf_out = hidden_states.new_empty(
+            (m * (k // 16) if sf_linear_layout else _swizzled_sf_size(m, k), ),
+            dtype=torch.uint8)
         # Fresh allocations (new_empty), matching the real op's empty_cuda; not
         # empty_like, which would carry the input's layout in the trace.
         residual_out = hidden_states.new_empty(tuple(hidden_states.shape),
@@ -1327,6 +1329,7 @@ def _register_fake():
         scale_factor: torch.Tensor,
         eps: float,
         return_norm_out: bool,
+        sf_linear_layout: bool = False,
     ) -> List[torch.Tensor]:
         # Residual-less variant. quant_out / sf_out as above; norm_out (packed,
         # contiguous) leads the tuple when return_norm_out.
@@ -1336,8 +1339,9 @@ def _register_fake():
         k = hidden_states.shape[-1]
         quant_shape = (*hidden_states.shape[:-1], k // 2)
         quant_out = hidden_states.new_empty(quant_shape, dtype=torch.uint8)
-        sf_out = hidden_states.new_empty((_swizzled_sf_size(m, k), ),
-                                         dtype=torch.uint8)
+        sf_out = hidden_states.new_empty(
+            (m * (k // 16) if sf_linear_layout else _swizzled_sf_size(m, k), ),
+            dtype=torch.uint8)
         if return_norm_out:
             norm_out = hidden_states.new_empty(tuple(hidden_states.shape),
                                                dtype=hidden_states.dtype)

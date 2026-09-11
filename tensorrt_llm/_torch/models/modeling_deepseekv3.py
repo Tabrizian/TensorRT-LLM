@@ -146,6 +146,33 @@ def moe_reduce_add_shared_output(routed_output, shared_output, out=None):
     return shared_output.add_(routed_reduced)
 
 
+def _moe_static_nvfp4_input_scale(experts):
+    """Return the routed experts' static NVFP4 input scale if the MoE can take a
+    pre-quantized `Fp4QuantizedTensor` activation, else None.
+
+    Eligible iff the MoE backend is CuteDslFusedMoE with NVFP4 experts and a
+    loaded `fc31_input_scale`, and its comm strategy dispatches post-quant
+    (NVLinkOneSided / allgather), so the scheduler's quantize_input step just
+    unpacks the tensor instead of running quantize_with_block_size. That
+    re-read of the post-norm activation (100 MB + 25 MB out at 16k tokens,
+    ~6 ms/step on GLM 5.2 prefill) is what folding the quant into the
+    producing add+RMSNorm removes."""
+    from ..modules.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
+    if experts is None:
+        return None
+    backend = getattr(experts, "backend", experts)
+    if not isinstance(backend, CuteDslFusedMoE) or not getattr(
+            backend, "has_nvfp4", False):
+        return None
+    scale = getattr(backend, "fc31_input_scale", None)
+    if not isinstance(scale, torch.Tensor):
+        return None
+    comm = getattr(experts, "comm", None)
+    if comm is not None and not comm.supports_post_quant_dispatch():
+        return None
+    return scale
+
+
 def _static_nvfp4_input_scale(linear):
     """Return `linear`'s calibrated NVFP4 input_scale if it is eligible to be
     folded into a producing RMSNorm's fused NVFP4 quantize, else None.
@@ -1508,6 +1535,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 do_finalize=do_finalize,
             )
 
+        hidden_states_fp4 = None
         if self.fusion_config.PRE_MOE_FUSION:
             # moe_backend can be either CUTLASS or TRTLLM here
             # TODO: unify the two min-latency MoE backends by enabling quant fusion
@@ -1520,6 +1548,40 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                     eps=self.post_attention_layernorm.variance_epsilon,
                     trigger_completion_at_end=False,
                 ))
+        elif self.post_attention_layernorm.nvfp4_scale is not None:
+            # Attention-DP / no-allreduce path with the routed experts' NVFP4
+            # input-quant folded into this norm (post_load_weights attached
+            # the scale, see _moe_static_nvfp4_input_scale): one kernel emits
+            # the residual sum, the BF16 normed value (router + BF16 shared
+            # experts) and the FP4 activation + linear-layout scale factors the
+            # MoE dispatch consumes directly.
+            fp4_hidden, residual = self.post_attention_layernorm(
+                hidden_states, residual, return_norm_out=True)
+            hidden_states = fp4_hidden.unquantized_hidden_states
+            experts = self.mlp.experts
+            # The scheduler's multi-chunk path and its 0-token-rank DP padding
+            # split / pad a plain tensor; mirror its own chunk rule and hand the
+            # FP4 tensor over only for the single-chunk, all-ranks-non-empty
+            # case (else the BF16 view goes down the old re-quantize path).
+            art = attn_metadata.all_rank_num_tokens
+            if art is None:
+                art = [hidden_states.shape[0]]
+            single_chunk = True
+            try:
+                if hasattr(experts, "calculate_num_chunks"):
+                    single_chunk = experts.calculate_num_chunks(list(art)) == 1
+            except Exception:  # non-DP asserts on multi-element lists etc.
+                single_chunk = False
+            if (get_sm_version() != 120 and single_chunk
+                    and all(t > 0 for t in art)):
+                # The MoE dispatch / grouped GEMMs take the packed FP4 as
+                # uint8 (what fp4_quantize returns); the norm op emits the
+                # float4_e2m1fn_x2 view of the same bytes.
+                hidden_states_fp4 = Fp4QuantizedTensor(
+                    fp4_hidden.fp4_tensor.view(torch.uint8),
+                    fp4_hidden.scaling_factor,
+                    is_sf_swizzled=False,
+                    unquantized_hidden_states=hidden_states)
         else:
             # No fusion
             hidden_states, residual = self.post_attention_layernorm(
@@ -1533,7 +1595,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                  and self.mlp.experts.has_nvfp4 and self.is_p2p_supported))
 
         hidden_states = _run_MoE(hidden_states,
-                                 hidden_states_fp4=None,
+                                 hidden_states_fp4=hidden_states_fp4,
                                  do_finalize=do_finalize)
 
         if self.fusion_config.POST_MOE_FUSION:
@@ -2053,3 +2115,15 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                 layer.post_attention_layernorm.nvfp4_scale = (
                     _static_nvfp4_input_scale(getattr(mlp, "gate_up_proj",
                                                       None)))
+            elif isinstance(mlp, Deepseekv3MoE):
+                # Intra-layer MoE fold: post_attention_layernorm -> the routed
+                # experts' NVFP4 input-quant (CuteDSL backend only, see
+                # _moe_static_nvfp4_input_scale). The MoE dispatch needs the
+                # scale factors in the linear layout, so flag the norm; the
+                # router gate and the BF16 shared experts keep reading the
+                # BF16 view that the fused kernel emits alongside.
+                moe_scale = _moe_static_nvfp4_input_scale(
+                    getattr(mlp, "experts", None))
+                if moe_scale is not None:
+                    layer.post_attention_layernorm.nvfp4_scale = moe_scale
+                    layer.post_attention_layernorm.nvfp4_sf_linear = True
