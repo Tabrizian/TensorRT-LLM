@@ -468,6 +468,9 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         for key in [EventType.Main, EventType.MoeOutputMemset]:
             if key not in self.event_dict:
                 self.event_dict[key] = torch.cuda.Event()
+        # data_ptr of the moe_output buffer that prezero_moe_output() already
+        # zeroed for the current forward (see that method); None = not prezeroed.
+        self._prezeroed_moe_output_ptr = None
 
     def _build_local_weight_view(self) -> NvFp4WeightView:
         """Build the weight view from this backend's per-layer weights."""
@@ -536,6 +539,38 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         if x_sf is not None:
             x_sf = x_sf.view(x_row, -1)
         return x, x_sf
+
+    def prezero_moe_output(self, moe_output: torch.Tensor) -> None:
+        """Zero-fill the fused-finalize output buffer ahead of time.
+
+        The fused finalize (grouped GEMM2 + scatter-accumulate) needs its
+        output zeroed. run_moe_nvfp4_impl issues that memset on the
+        MoeOutputMemset aux stream right after moe_sort, so it overlaps only
+        the FC1 gather-GEMM and, both being HBM-heavy, most of it stays exposed
+        (measured ~74% exposed on GLM 5.2 16k prefill: 402 MB/layer at EP4).
+
+        The NVLinkOneSided combine payload lives in a fixed workspace, so the
+        scheduler can hand it to us at the very start of the MoE chunk, before
+        routing / quantization / dispatch: the previous layer's combine (the
+        last reader) is already ordered before us on the main stream, and the
+        zero-fill then overlaps ~40 ms of router GEMM, top-k, NVFP4 quant and
+        all-to-all dispatch that barely touch HBM. run_moe_nvfp4_impl detects
+        the pre-zeroed buffer by data_ptr and skips its own memset; the
+        MoeOutputMemset event still gates the finalize kernel.
+        """
+        if not self.use_fused_finalize:
+            return
+        self.event_dict[EventType.Main].record()
+        with torch.cuda.stream(
+                self.aux_stream_dict[AuxStreamType.MoeOutputMemset]):
+            self.event_dict[EventType.Main].wait()
+            moe_output.record_stream(
+                self.aux_stream_dict[AuxStreamType.MoeOutputMemset])
+            # cudaMemsetAsync, not tensor.zero_(): the torch fill kernel took
+            # 209 us vs 85 us for the memset on the 402 MB EP4/16k payload.
+            torch.ops.trtllm.moe_output_memset_all_inplace(moe_output)
+            self.event_dict[EventType.MoeOutputMemset].record()
+        self._prezeroed_moe_output_ptr = moe_output.data_ptr()
 
     def run_moe_nvfp4(
         self,
@@ -658,21 +693,30 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         )
 
         if self.use_fused_finalize:
-            with torch.cuda.stream(
-                    self.aux_stream_dict[AuxStreamType.MoeOutputMemset]):
-                self.event_dict[EventType.Main].wait()
-                torch.ops.trtllm.moe_output_memset_inplace(
-                    input=moe_output,
-                    tile_idx_to_mn_limit=tile_idx_to_mn_limit,
-                    expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
-                    permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
-                    num_non_exiting_tiles=num_non_exiting_tiles,
-                    tile_tokens_dim=tile_size,
-                    top_k=effective_top_k,
-                    ep_size=self.mapping.moe_ep_size,
-                    enable_alltoall=enable_alltoall,
-                )
-                self.event_dict[EventType.MoeOutputMemset].record()
+            prezeroed = (self._prezeroed_moe_output_ptr is not None
+                         and self._prezeroed_moe_output_ptr
+                         == moe_output.data_ptr())
+            self._prezeroed_moe_output_ptr = None
+            if not prezeroed:
+                with torch.cuda.stream(
+                        self.aux_stream_dict[AuxStreamType.MoeOutputMemset]):
+                    self.event_dict[EventType.Main].wait()
+                    torch.ops.trtllm.moe_output_memset_inplace(
+                        input=moe_output,
+                        tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+                        expanded_idx_to_permuted_idx=
+                        expanded_idx_to_permuted_idx,
+                        permuted_idx_to_expanded_idx=
+                        permuted_idx_to_expanded_idx,
+                        num_non_exiting_tiles=num_non_exiting_tiles,
+                        tile_tokens_dim=tile_size,
+                        top_k=effective_top_k,
+                        ep_size=self.mapping.moe_ep_size,
+                        enable_alltoall=enable_alltoall,
+                    )
+                    self.event_dict[EventType.MoeOutputMemset].record()
+            # Either way the finalize kernel below must not start before the
+            # zero-fill (issued here or by prezero_moe_output) has landed.
             self.event_dict[EventType.MoeOutputMemset].wait()
 
             torch.ops.trtllm.cute_dsl_nvfp4_grouped_gemm_finalize_inplace_blackwell(

@@ -276,6 +276,19 @@ torch::Tensor moe_unpermute(torch::Tensor const& permuted_input, torch::Tensor c
     return output;
 }
 
+// Zero the whole fused-finalize output buffer (cudaMemsetAsync on the current
+// stream). Used to pre-zero the NVLinkOneSided combine payload before the MoE
+// chunk's routing/dispatch, when the tile metadata moe_output_memset_inplace
+// needs does not exist yet. cudaMemsetAsync is ~2.5x faster than a torch
+// fill kernel on a 400 MB bf16 buffer.
+void moe_output_memset_all_inplace(torch::Tensor const& input)
+{
+    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
+    TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
+    auto const& stream = at::cuda::getCurrentCUDAStream(input.get_device());
+    cudaMemsetAsync(input.data_ptr(), 0x0, input.numel() * input.element_size(), stream);
+}
+
 void moe_output_memset_inplace(torch::Tensor const& input, torch::Tensor const& tile_idx_to_mn_limit,
     torch::Tensor const& expanded_idx_to_permuted_idx, torch::Tensor const& permuted_idx_to_expanded_idx,
     torch::Tensor const& num_non_exiting_tiles, int64_t const tile_tokens_dim, int64_t const top_k,
@@ -513,6 +526,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "topk_scales) -> ()");
     m.def("moe_unpermute(Tensor permuted_input, Tensor expanded_idx_to_permuted_idx, Tensor topk_scales) -> Tensor");
     m.def(
+        "moe_output_memset_all_inplace(Tensor(a!) input) -> ()");
+    m.def(
         "moe_output_memset_inplace(Tensor(a!) input, Tensor tile_idx_to_mn_limit, Tensor expanded_idx_to_permuted_idx, "
         "Tensor permuted_idx_to_expanded_idx, Tensor num_non_exiting_tiles, int tile_tokens_dim, int top_k, int "
         "ep_size, bool enable_alltoall = False) -> ()");
@@ -535,6 +550,7 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
     m.impl("moe_unpermute_inplace", &tensorrt_llm::torch_ext::moe_unpermute_inplace);
     m.impl("moe_unpermute", &tensorrt_llm::torch_ext::moe_unpermute);
     m.impl("moe_output_memset_inplace", &tensorrt_llm::torch_ext::moe_output_memset_inplace);
+    m.impl("moe_output_memset_all_inplace", &tensorrt_llm::torch_ext::moe_output_memset_all_inplace);
     m.impl("moe_swiglu", &tensorrt_llm::torch_ext::moe_swiglu);
     m.impl("moe_swiglu_nvfp4_quantize", &tensorrt_llm::torch_ext::moe_swiglu_nvfp4_quantize);
     m.impl("moe_gelu", &tensorrt_llm::torch_ext::moe_gelu);

@@ -498,6 +498,11 @@ class NVLinkOneSided(Communication):
         self._dispatch_state["combine_payload_offset"] = int(combine_payload_offset)
         self._dispatch_state["local_num_tokens"] = token_selected_slots.size(0)
         self._dispatch_state["runtime_max_tokens_per_rank"] = runtime_max_tokens_per_rank
+        # Remembered across the combine's reset_state(): the combine payload
+        # offset is a pure function of the payload layout, so the next layer
+        # can pre-zero the buffer before its own dispatch (see
+        # peek_combine_payload_tensor_in_workspace).
+        self._last_combine_payload = (int(combine_payload_offset), int(runtime_max_tokens_per_rank))
         self._dispatch_state["active_rank_mask_snapshot"] = active_rank_mask_snapshot
         self._dispatch_state["phase"] = "dispatched"
 
@@ -632,6 +637,33 @@ class NVLinkOneSided(Communication):
         self.reset_state()
 
         return output
+
+    def peek_combine_payload_tensor_in_workspace(
+        self, runtime_max_tokens_per_rank: int, hidden_size: int, dtype: torch.dtype
+    ) -> Optional[torch.Tensor]:
+        """Like ``get_combine_payload_tensor_in_workspace`` but usable BEFORE this
+        round's dispatch: reuses the combine payload offset recorded by the last
+        successful dispatch, valid because the offset only depends on the payload
+        layout (ep_size, max tokens per rank, hidden, dtype, top_k), which does
+        not change between MoE layers of one forward. Returns None when no
+        dispatch has happened yet (first layer of the first forward / warmup) or
+        the token budget differs. The caller only uses the tensor to pre-zero it;
+        the authoritative handle for the MoE output is still the post-dispatch
+        getter, which returns the same view.
+        """
+        last = getattr(self, "_last_combine_payload", None)
+        if last is None or last[1] != int(runtime_max_tokens_per_rank):
+            return None
+        combine_payload_offset = last[0]
+        return torch.ops.trtllm.moe_a2a_get_combine_payload_tensor(
+            self.workspace,
+            int(self.ep_rank),
+            int(self.ep_size),
+            int(runtime_max_tokens_per_rank),
+            int(combine_payload_offset),
+            dtype,
+            int(hidden_size),
+        )
 
     def reset_state(self) -> None:
         """Reset the dispatch/combine state machine to ``idle``.

@@ -370,6 +370,28 @@ class ExternalCommMoEScheduler(MoEScheduler):
         """
         moe = self.moe
 
+        # ========== Step 0: pre-zero the fused-finalize output buffer ==========
+        # CuteDSL NVFP4 with NVLinkOneSided keeps the combine payload in a fixed
+        # workspace; zero it now on the aux stream so the fill overlaps routing,
+        # quantization and dispatch instead of the FC1 GEMM (see
+        # CuteDslFusedMoE.prezero_moe_output). Same tensor _get_backend_kwargs
+        # hands to run_moe later (workspace-backed, keyed on the same args).
+        if (
+            isinstance(moe.comm, NVLinkOneSided)
+            and hasattr(moe.backend, "prezero_moe_output")
+            and getattr(moe.backend, "has_nvfp4", False)
+            and moe.backend.supports_moe_output_in_alltoall_workspace()
+            and all_rank_num_tokens is not None
+        ):
+            # Before this layer's dispatch the comm state is idle, so peek at the
+            # payload offset the previous dispatch recorded; None on the very first
+            # MoE layer (that one falls back to the in-run memset).
+            _prezero_out = moe.comm.peek_combine_payload_tensor_in_workspace(
+                max(all_rank_num_tokens), moe.hidden_size, output_dtype
+            )
+            if _prezero_out is not None:
+                moe.backend.prezero_moe_output(_prezero_out)
+
         # ========== Step 1: EPLB - Start wait GPU stage ==========
         moe._load_balancer_start_wait_gpu_stage(is_first_call)
 
