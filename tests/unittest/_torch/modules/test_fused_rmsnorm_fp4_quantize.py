@@ -464,3 +464,124 @@ def test_rmsnorm_ws_kernel_gate(m, n, residual, contiguous, expect_ws):
         hs = torch.empty((m, n + 32), dtype=torch.bfloat16, device="meta")[:, :n]
         assert not hs.is_contiguous()
     assert norm._ws_kernel_eligible(hs, res) is expect_ws
+
+
+# ---------------------------------------------------------------------------
+# sf_linear_layout: MoE consumers (post-quant all-to-all / allgather dispatch)
+# need the scale factors row-major [m, n/16] rather than GEMM-swizzled.
+# ---------------------------------------------------------------------------
+
+
+def fp4_quantize_linear_ref(normed: torch.Tensor, sf_scale: torch.Tensor):
+    """The unfused MoE input quant: fp4_quantize with isSfSwizzledLayout=False
+    (CuteDslFusedMoE.quantize_input / WideEPMoE.forward_chunk)."""
+    return torch.ops.trtllm.fp4_quantize(normed.contiguous(), sf_scale, SF_VEC, False, False)
+
+
+def assert_linear_sf_match(sf_fused, sf_ref, m, n, ctx):
+    """Linear layout has no padding: both are exactly m * n/16 bytes and must
+    agree at the same >= threshold rate as the packed FP4 (a boundary flip in a
+    block's amax moves its E4M3 scale by one step)."""
+    assert sf_fused.numel() == m * (n // SF_VEC), f"linear SF size {sf_fused.numel()} != {m * n // SF_VEC} ({ctx})"
+    assert sf_ref.numel() == sf_fused.numel(), ctx
+    match = (sf_fused.view(-1) == sf_ref.view(-1)).float().mean().item()
+    assert match >= _FP4_MATCH_THRESHOLD, f"linear SF match {match:.4f} < {_FP4_MATCH_THRESHOLD} ({ctx})"
+
+
+@skip_unless_add_rmsnorm
+@pytest.mark.parametrize("m", [1, 7, 64, 300])
+@pytest.mark.parametrize("n", [128, 6144])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_fused_add_rmsnorm_fp4_quantize_linear_sf(m, n, dtype):
+    """sf_linear_layout=True: FP4 bytes identical to the swizzled path, SF in
+    the row-major layout fp4_quantize(isSfSwizzledLayout=False) produces."""
+    torch.manual_seed(7)
+    device = torch.device("cuda")
+    eps = 1e-6
+    hidden = torch.randn(m, n, dtype=dtype, device=device)
+    residual = torch.randn(m, n, dtype=dtype, device=device)
+    weight = torch.randn(n, dtype=dtype, device=device)
+
+    added = hidden.float() + residual.float()
+    normed_ref = rms_norm_ref(added.to(dtype), weight, eps)
+    sf_scale = make_sf_scale(normed_ref)
+    fp4_ref, sf_ref_lin = fp4_quantize_linear_ref(normed_ref, sf_scale)
+
+    q_lin, sf_lin, res_lin = torch.ops.trtllm.fused_add_rmsnorm_fp4_quantize(
+        hidden, residual, weight, sf_scale, eps, False, True
+    )
+    q_swz, sf_swz, _ = torch.ops.trtllm.fused_add_rmsnorm_fp4_quantize(
+        hidden, residual, weight, sf_scale, eps, False, False
+    )
+    ctx = f"add-rmsnorm linear m={m} n={n}"
+    # The layout flag must not touch the quantized values themselves.
+    assert torch.equal(q_lin.view(torch.uint8), q_swz.view(torch.uint8)), f"FP4 differs between SF layouts ({ctx})"
+    assert_fp4_match(q_lin, fp4_ref, ctx)
+    assert_linear_sf_match(sf_lin, sf_ref_lin, m, n, ctx)
+    # Swizzled buffer is padded (rows -> 128, cols -> 4); linear is exact.
+    assert sf_swz.numel() >= sf_lin.numel()
+    torch.testing.assert_close(res_lin.float(), added, rtol=2e-2, atol=2e-2)
+
+    # return_norm_out=True keeps the same tuple layout with the norm leading.
+    norm_out, q2, sf2, _ = torch.ops.trtllm.fused_add_rmsnorm_fp4_quantize(
+        hidden, residual, weight, sf_scale, eps, True, True
+    )
+    assert norm_out.shape == hidden.shape and norm_out.dtype == dtype
+    assert torch.equal(q2.view(torch.uint8), q_lin.view(torch.uint8))
+    assert torch.equal(sf2, sf_lin)
+
+
+@skip_unless_rmsnorm
+@pytest.mark.parametrize("m", [3, 64])
+@pytest.mark.parametrize("n", [512, 6144])
+def test_fused_rmsnorm_fp4_quantize_linear_sf(m, n):
+    torch.manual_seed(11)
+    device = torch.device("cuda")
+    dtype, eps = torch.bfloat16, 1e-6
+    hidden = torch.randn(m, n, dtype=dtype, device=device)
+    weight = torch.randn(n, dtype=dtype, device=device)
+    normed_ref = rms_norm_ref(hidden, weight, eps)
+    sf_scale = make_sf_scale(normed_ref)
+    fp4_ref, sf_ref_lin = fp4_quantize_linear_ref(normed_ref, sf_scale)
+    q_lin, sf_lin = torch.ops.trtllm.fused_rmsnorm_fp4_quantize(hidden, weight, sf_scale, eps, False, True)
+    ctx = f"rmsnorm linear m={m} n={n}"
+    assert_fp4_match(q_lin, fp4_ref, ctx)
+    assert_linear_sf_match(sf_lin, sf_ref_lin, m, n, ctx)
+
+
+@skip_unless_add_rmsnorm
+def test_rmsnorm_module_nvfp4_sf_linear():
+    """RMSNorm.nvfp4_sf_linear routes the fused path to the linear-SF kernel
+    (bypassing the swizzled-only warp-specialized kernel even at ws-eligible
+    sizes) and marks the Fp4QuantizedTensor unswizzled with the BF16 view
+    attached -- the contract Deepseekv3 forward_MoE relies on."""
+    from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+    from tensorrt_llm._torch.utils import Fp4QuantizedTensor
+
+    torch.manual_seed(3)
+    device = torch.device("cuda")
+    m, n, dtype, eps = 2048, 6144, torch.bfloat16, 1e-6  # ws-eligible shape
+    norm = RMSNorm(hidden_size=n, eps=eps, dtype=dtype, quantize_type="nvfp4").to(device)
+    if not norm.is_nvfp4:
+        pytest.skip("NVFP4 RMSNorm fusion not enabled on this platform")
+    norm.weight.data = torch.randn(n, dtype=dtype, device=device)
+    hidden = torch.randn(m, n, dtype=dtype, device=device)
+    residual = torch.randn(m, n, dtype=dtype, device=device)
+    normed_ref = rms_norm_ref((hidden.float() + residual.float()).to(dtype), norm.weight, eps)
+    norm.nvfp4_scale = make_sf_scale(normed_ref)
+
+    norm.nvfp4_sf_linear = False
+    fp4_swz, _ = norm(hidden, residual)
+    assert isinstance(fp4_swz, Fp4QuantizedTensor) and fp4_swz.is_sf_swizzled
+
+    norm.nvfp4_sf_linear = True
+    fp4_lin, residual_out = norm(hidden, residual, return_norm_out=True)
+    assert isinstance(fp4_lin, Fp4QuantizedTensor)
+    assert not fp4_lin.is_sf_swizzled
+    assert fp4_lin.scaling_factor.numel() == m * (n // SF_VEC)
+    assert fp4_lin.unquantized_hidden_states is not None
+    assert fp4_lin.unquantized_hidden_states.shape == (m, n)
+    assert fp4_lin.fp4_tensor.shape == (m, n // 2)
+    torch.testing.assert_close(residual_out.float(), hidden.float() + residual.float(), rtol=2e-2, atol=2e-2)
+    _, sf_ref_lin = fp4_quantize_linear_ref(normed_ref, norm.nvfp4_scale)
+    assert_linear_sf_match(fp4_lin.scaling_factor, sf_ref_lin, m, n, "RMSNorm module linear")
