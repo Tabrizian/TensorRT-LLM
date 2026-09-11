@@ -1,177 +1,270 @@
-"""Prefix-tokenization cache for the default input processor.
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+"""Prefix-tokenization cache for ``DefaultInputProcessor``.
 
-In multi-turn agentic serving each turn's prompt is the previous turn's prompt
-plus a small delta, yet the frontend re-tokenizes the whole thing every turn. On
-a GLM-5.2 disaggregated context server with ~38k-token prompts, nsys attributed
-47.4% of context wall-clock to "tokenize prompt" at 43.7 ms/request. Caching the
-tokenization of the longest cached prefix and tokenizing only the tail brought
-that to 5.49 ms/request (10.5% of wall) with byte-identical token IDs.
+In multi-turn serving each prompt is usually the previous prompt plus a small
+delta, so re-tokenizing the whole prompt every turn is wasted work. This cache
+remembers the token ids of recent prompts and, when a new prompt extends a
+cached one, tokenizes only the tail and splices it onto the cached ids.
 
-CORRECTNESS. Splitting a string and tokenizing the tail in isolation is NOT
-generally equal to tokenizing the whole: BPE merges can straddle the split. So
-the cache backs off `overlap` tokens from the split point, re-tokenizes from
-there, and requires the first `resync` re-tokenized ids to equal the cached ids
-over the same span. That proves the tokenizer has re-synchronized at the seam;
-if it has not, the prompt is tokenized in full. Validated on real trajectories:
-192/192 exact token-ID matches, 0 resync fallbacks, thread-safe under 8
-concurrent input_processor workers.
+Tokenizing a tail in isolation is not generally identical to tokenizing the
+whole prompt, because BPE merges can straddle the split. The cache therefore
+backs off ``overlap`` tokens from the end of the cached prefix, re-tokenizes
+from there, and accepts the splice only if the first ``resync`` re-tokenized ids
+equal the cached ids over the same span. Otherwise the prompt is tokenized in
+full.
 
-Off by default; enable with TLLM_PREFIX_TOKEN_CACHE=1.
+Off by default; enable with ``TLLM_PREFIX_TOKEN_CACHE=1``. Each
+``DefaultInputProcessor`` owns its own cache, so cached ids are never shared
+across tokenizers. Environment variables, eligibility rules, and measured
+effect are documented in ``docs/source/deployment-guide/prefix-tokenization-cache.md``.
 """
 
-import bisect
+from __future__ import annotations
+
 import os
 import threading
-from typing import List, Optional
+from array import array
+from collections import OrderedDict
+from dataclasses import dataclass
+from typing import ClassVar, Mapping, Protocol, Sequence
 
-__all__ = ["PrefixTokenCache", "get_prefix_token_cache", "prefix_cache_enabled"]
+from ..logger import logger
+
+__all__ = [
+    "PrefixTokenCache",
+    "PrefixTokenCacheConfig",
+    "create_prefix_token_cache",
+    "prefix_cache_enabled",
+]
+
+ENABLE_ENV_VAR = "TLLM_PREFIX_TOKEN_CACHE"
+# Log the hit rate every this many cache-eligible requests, so an operator can
+# see whether the cache is doing anything without reading its counters.
+LOG_EVERY_REQUESTS = 1000
 
 
 def prefix_cache_enabled() -> bool:
-    return os.environ.get("TLLM_PREFIX_TOKEN_CACHE", "0") == "1"
+    return os.environ.get(ENABLE_ENV_VAR, "0") == "1"
+
+
+class OffsetTokenizer(Protocol):
+    """The subset of the HF fast-tokenizer call interface the cache relies on."""
+
+    def __call__(
+        self, text: str, *, add_special_tokens: bool, return_offsets_mapping: bool
+    ) -> Mapping[str, Sequence]: ...
+
+
+@dataclass(frozen=True)
+class PrefixTokenCacheConfig:
+    """Tunables for :class:`PrefixTokenCache`.
+
+    The sizing fields have env overrides (see ``ENV_VARS``); ``overlap`` and
+    ``resync`` are correctness internals and do not.
+    """
+
+    max_entries: int = 512
+    # Total characters of cached prompt text. The cached ids are int32, about
+    # one byte per character of English text, so this bounds host memory to
+    # roughly twice this many bytes.
+    max_total_chars: int = 64 * 1024 * 1024
+    # Prompts shorter than this are tokenized normally and never cached. Also
+    # the number of leading characters entries are bucketed by, so a lookup does
+    # not scan every entry.
+    min_chars: int = 4096
+    # Tokens to back off from the end of the cached prefix before re-tokenizing.
+    overlap: int = 64
+    # Re-tokenized ids that must equal the cached ids for the splice to be used.
+    resync: int = 32
+
+    ENV_VARS: ClassVar[dict[str, str]] = {
+        "max_entries": "TLLM_PREFIX_TOKEN_CACHE_ENTRIES",
+        "max_total_chars": "TLLM_PREFIX_TOKEN_CACHE_MAX_CHARS",
+        "min_chars": "TLLM_PREFIX_TOKEN_CACHE_MIN_CHARS",
+    }
+
+    @classmethod
+    def from_env(cls) -> PrefixTokenCacheConfig:
+        """Build a config from the environment.
+
+        Raises:
+            ValueError: if an override is not a positive integer.
+        """
+        overrides: dict[str, int] = {}
+        for field_name, env_var in cls.ENV_VARS.items():
+            raw = os.environ.get(env_var)
+            if raw is None:
+                continue
+            if not raw.isdigit() or int(raw) == 0:
+                raise ValueError(f"{env_var} must be a positive integer, got {raw!r}")
+            overrides[field_name] = int(raw)
+        return cls(**overrides)
+
+
+@dataclass(slots=True)
+class _Entry:
+    text: str
+    ids: array  # int32
+    # Every prompt that extends ``text`` is re-tokenized from the same place:
+    # token ``split_token``, which starts at character ``split_char``.
+    split_token: int
+    split_char: int
 
 
 class PrefixTokenCache:
     """Splice a cached prefix's token ids with a freshly tokenized tail.
 
-    Entries are bucketed by a hash of their first `bucket_chars` characters so
-    that finding the longest cached prefix of an incoming prompt does not scan
-    every entry. Eviction is LRU on insertion order.
+    Thread-safe. Eviction is least-recently-used, bounded by both entry count
+    and total cached characters. When a prompt extends a cached entry, the new
+    prompt replaces that entry rather than sitting alongside it, so a
+    conversation costs one entry however many turns it has.
+
+    An unexpected error disables the cache, with a warning, and every prompt is
+    tokenized in full from then on: a cache bug must never fail a request.
     """
 
-    def __init__(self,
-                 max_entries: int = 512,
-                 overlap: int = 64,
-                 resync: int = 32,
-                 min_chars: int = 4096,
-                 bucket_chars: int = 2048) -> None:
+    def __init__(self, config: PrefixTokenCacheConfig) -> None:
+        self._config = config
         self._lock = threading.Lock()
-        self._max_entries = max_entries
-        self._overlap = overlap
-        self._resync = resync
-        self._min_chars = min_chars
-        self._bucket_chars = bucket_chars
-        self._buckets = {}   # bucket key -> [entry id]
-        self._entries = {}   # entry id -> (text, ids, ends, starts, bucket key)
-        self._order = []     # entry ids, oldest first
+        self._entries: OrderedDict[int, _Entry] = OrderedDict()  # LRU order
+        self._buckets: dict[int, set[int]] = {}
+        self._total_chars = 0
         self._next_id = 0
-        # counters, for logging/tests only
+        self.disabled = False
+        # Counters, reported by periodic log lines and read by tests.
         self.hits = 0
         self.misses = 0
         self.resync_failures = 0
 
-    @property
-    def min_chars(self) -> int:
-        return self._min_chars
+    def encode(self, tokenizer: OffsetTokenizer, text: str) -> list[int]:
+        """Return the token ids of ``text`` without special tokens."""
+        if self.disabled or len(text) < self._config.min_chars:
+            return self._tokenize(tokenizer, text)[0]
+        try:
+            return self._encode(tokenizer, text)
+        except Exception as e:
+            self.disabled = True
+            logger.warning(
+                f"Disabling the prefix token cache after an error: {e!r} ({self.summary()})"
+            )
+            return self._tokenize(tokenizer, text)[0]
 
-    def _bucket_key(self, text: str):
-        return hash(text[:self._bucket_chars])
+    def summary(self) -> str:
+        """One-line hit-rate and occupancy summary. Caller need not hold the lock."""
+        total = self.hits + self.misses
+        rate = self.hits / total if total else 0.0
+        return (
+            f"{self.hits}/{total} hits ({rate:.1%}), "
+            f"{self.resync_failures} resync fallbacks, "
+            f"{len(self._entries)} entries, {self._total_chars} cached chars"
+        )
 
-    def _find_longest_prefix(self, text: str):
-        """Longest cached entry that is a prefix of `text`. Caller holds lock."""
-        best, best_len = None, 0
-        for eid in self._buckets.get(self._bucket_key(text), ()):
-            entry = self._entries.get(eid)
-            if entry is None:
-                continue
-            ptext = entry[0]
-            n = len(ptext)
-            if n > best_len and n <= len(text) and text.startswith(ptext):
-                best, best_len = entry, n
-        return best
+    def _encode(self, tokenizer: OffsetTokenizer, text: str) -> list[int]:
+        found = self._lookup(text)
+        ids = None
+        if found is not None:
+            eid, entry = found
+            tail_ids, tail_offsets = self._tokenize(tokenizer, text[entry.split_char :])
+            if self._resynced(entry, tail_ids):
+                ids = entry.ids[: entry.split_token].tolist() + list(tail_ids)
+                base_token, base_char = entry.split_token, entry.split_char
+        if ids is None:
+            tail_ids, tail_offsets = self._tokenize(tokenizer, text)
+            ids, base_token, base_char = tail_ids, 0, 0
 
-    def _evict(self) -> None:
-        """Caller holds lock."""
-        while len(self._order) > self._max_entries:
-            old = self._order.pop(0)
-            entry = self._entries.pop(old, None)
-            if entry is None:
-                continue
-            bucket = self._buckets.get(entry[4])
-            if bucket and old in bucket:
-                bucket.remove(old)
-                if not bucket:
-                    self._buckets.pop(entry[4], None)
-
-    def encode(self, tokenizer, text: str, **kwargs) -> List[int]:
-        reuse, start_char, prev = 0, 0, None
-        with self._lock:
-            entry = self._find_longest_prefix(text)
-            if entry is not None:
-                ptext, pids, pends, pstarts, _ = entry
-                i = bisect.bisect_right(pends, len(ptext)) - self._overlap
-                if i > 0:
-                    reuse, start_char = i, pstarts[i]
-                    prev = (pids, pends, pstarts)
-
-        # tokenize outside the lock: this is the expensive part
-        enc = tokenizer(text[start_char:],
-                        add_special_tokens=False,
-                        return_offsets_mapping=True,
-                        **kwargs)
-        new_ids, new_offsets = enc["input_ids"], enc["offset_mapping"]
-
-        if reuse:
-            pids, pends, pstarts = prev
-            span = min(self._resync, len(pids) - reuse, len(new_ids))
-            if span <= 0 or list(new_ids[:span]) != list(pids[reuse:reuse +
-                                                             span]):
-                # the tokenizer did not re-synchronize at the seam
-                with self._lock:
-                    self.resync_failures += 1
-                reuse, start_char = 0, 0
-                enc = tokenizer(text,
-                                add_special_tokens=False,
-                                return_offsets_mapping=True,
-                                **kwargs)
-                new_ids, new_offsets = enc["input_ids"], enc["offset_mapping"]
-
-        if reuse:
-            pids, pends, pstarts = prev
-            ids = pids[:reuse] + list(new_ids)
-            starts = pstarts[:reuse] + [a + start_char for a, _ in new_offsets]
-            ends = pends[:reuse] + [b + start_char for _, b in new_offsets]
-        else:
-            ids = list(new_ids)
-            starts = [a for a, _ in new_offsets]
-            ends = [b for _, b in new_offsets]
+        # Where a prompt extending this one will be re-tokenized from.
+        split_token = len(ids) - self._config.overlap
+        tail_index = split_token - base_token
 
         with self._lock:
-            if reuse:
-                self.hits += 1
-            else:
+            if found is None:
                 self.misses += 1
-            eid = self._next_id
-            self._next_id += 1
-            key = self._bucket_key(text)
-            self._entries[eid] = (text, ids, ends, starts, key)
-            self._buckets.setdefault(key, []).append(eid)
-            self._order.append(eid)
-            self._evict()
+            elif base_token == 0:
+                self.misses += 1
+                self.resync_failures += 1
+            else:
+                self.hits += 1
+            if found is not None:
+                self._remove(found[0])
+            if split_token > 0 and tail_index >= 0:
+                self._insert(text, ids, split_token, base_char + tail_offsets[tail_index][0])
+            report = (self.hits + self.misses) % LOG_EVERY_REQUESTS == 0
+            summary = self.summary() if report else None
+        if summary is not None:
+            logger.info(f"Prefix token cache: {summary}")
         return ids
 
+    @staticmethod
+    def _tokenize(
+        tokenizer: OffsetTokenizer, text: str
+    ) -> tuple[list[int], Sequence[tuple[int, int]]]:
+        enc = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
+        return enc["input_ids"], enc["offset_mapping"]
 
-_CACHE: Optional[PrefixTokenCache] = None
-_CACHE_LOCK = threading.Lock()
+    def _resynced(self, entry: _Entry, tail_ids: Sequence[int]) -> bool:
+        """Whether the tokenizer re-synchronized with the cached ids at the seam."""
+        cached_tail = entry.ids[entry.split_token :]
+        span = min(self._config.resync, len(tail_ids), len(cached_tail))
+        return span > 0 and list(tail_ids[:span]) == cached_tail[:span].tolist()
+
+    def _bucket_key(self, text: str) -> int:
+        return hash(text[: self._config.min_chars])
+
+    def _lookup(self, text: str) -> tuple[int, _Entry] | None:
+        """Longest cached entry that is a prefix of ``text``, promoted to MRU."""
+        with self._lock:
+            candidates = self._buckets.get(self._bucket_key(text), ())
+            for eid in sorted(candidates, key=lambda e: len(self._entries[e].text), reverse=True):
+                entry = self._entries[eid]
+                if text.startswith(entry.text):
+                    self._entries.move_to_end(eid)
+                    return eid, entry
+            return None
+
+    def _insert(self, text: str, ids: Sequence[int], split_token: int, split_char: int) -> None:
+        """Caller holds the lock."""
+        key = self._bucket_key(text)
+        bucket = self._buckets.setdefault(key, set())
+        if any(self._entries[eid].text == text for eid in bucket):
+            return  # concurrent misses on the same prompt
+        eid, self._next_id = self._next_id, self._next_id + 1
+        self._entries[eid] = _Entry(text, array("i", ids), split_token, split_char)
+        bucket.add(eid)
+        self._total_chars += len(text)
+        while self._entries and (
+            len(self._entries) > self._config.max_entries
+            or self._total_chars > self._config.max_total_chars
+        ):
+            self._remove(next(iter(self._entries)))
+
+    def _remove(self, eid: int) -> None:
+        """Caller holds the lock. A no-op if another thread already removed it."""
+        entry = self._entries.pop(eid, None)
+        if entry is None:
+            return
+        self._total_chars -= len(entry.text)
+        key = self._bucket_key(entry.text)
+        bucket = self._buckets[key]
+        bucket.discard(eid)
+        if not bucket:
+            del self._buckets[key]
 
 
-def get_prefix_token_cache() -> PrefixTokenCache:
-    """Process-wide cache, created on first use."""
-    global _CACHE
-    if _CACHE is None:
-        with _CACHE_LOCK:
-            if _CACHE is None:
-                _CACHE = PrefixTokenCache(
-                    max_entries=int(
-                        os.environ.get("TLLM_PREFIX_TOKEN_CACHE_ENTRIES",
-                                       "512")),
-                    overlap=int(
-                        os.environ.get("TLLM_PREFIX_TOKEN_CACHE_OVERLAP",
-                                       "64")),
-                    resync=int(
-                        os.environ.get("TLLM_PREFIX_TOKEN_CACHE_RESYNC", "32")),
-                    min_chars=int(
-                        os.environ.get("TLLM_PREFIX_TOKEN_CACHE_MIN_CHARS",
-                                       "4096")),
-                )
-    return _CACHE
+def create_prefix_token_cache(tokenizer: object) -> PrefixTokenCache | None:
+    """Return a cache for ``tokenizer`` if the feature is enabled and usable.
+
+    Returns None when the feature is off or the tokenizer cannot report
+    offsets. Raises ``ValueError`` for a malformed env override.
+    """
+    if not prefix_cache_enabled() or tokenizer is None:
+        return None
+    if not getattr(tokenizer, "is_fast", False):
+        logger.warning(
+            f"{ENABLE_ENV_VAR} is set but the tokenizer is not a fast tokenizer, "
+            "which the prefix token cache needs for offset mappings; disabling it."
+        )
+        return None
+    config = PrefixTokenCacheConfig.from_env()
+    logger.info(f"Prefix token cache enabled: {config}")
+    return PrefixTokenCache(config)

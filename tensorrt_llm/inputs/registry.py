@@ -77,8 +77,7 @@ class InputProcessor(Protocol):
         ...
 
 
-from .prefix_token_cache import (get_prefix_token_cache,
-                                 prefix_cache_enabled)
+from .prefix_token_cache import create_prefix_token_cache
 
 
 class DefaultInputProcessor(InputProcessor):
@@ -93,6 +92,8 @@ class DefaultInputProcessor(InputProcessor):
         self.config = config
         self.model_path = model_path
         self.multimodal_hashing_supported = None
+        # Opt-in via TLLM_PREFIX_TOKEN_CACHE=1; None when disabled.
+        self._prefix_token_cache = create_prefix_token_cache(tokenizer)
 
     def __call__(
         self, inputs: TextPrompt, sampling_params: SamplingParams
@@ -100,6 +101,13 @@ class DefaultInputProcessor(InputProcessor):
         """The default input processor handles only tokenization."""
         if self.tokenizer is None:
             raise ValueError("tokenizer is required to tokenize string prompt")
+        # Only when the tokenizer would be called exactly as the cache calls it.
+        if (self._prefix_token_cache is not None
+                and not sampling_params.add_special_tokens
+                and sampling_params.truncate_prompt_tokens is None):
+            with nvtx_range_debug("tokenize prompt (prefix cache)"):
+                return self._prefix_token_cache.encode(self.tokenizer,
+                                                       inputs["prompt"]), None
         kwargs = {}
         if sampling_params.truncate_prompt_tokens is not None:
             kwargs = dict(truncation=True,
@@ -122,29 +130,6 @@ class DefaultInputProcessor(InputProcessor):
             "<|call|>",
             "<|reserved_200013|>",
         }
-        # Multi-turn prompts grow by a small delta each turn, so re-tokenizing
-        # the whole prompt every turn dominates context-server wall time
-        # (measured: 47.4% of it, 43.7 ms/request at ~38k tokens). When the
-        # prefix cache is enabled and the request is a plain long text prompt,
-        # reuse the tokenization of the longest cached prefix and tokenize only
-        # the tail. Requires a fast tokenizer for offset mappings, and is
-        # skipped whenever the arguments would change tokenization
-        # (add_special_tokens, truncation, or a separate query).
-        prompt = inputs.get("prompt")
-        cache = get_prefix_token_cache() if prefix_cache_enabled() else None
-        use_cache = (cache is not None and isinstance(prompt, str)
-                     and len(prompt) >= cache.min_chars and "query" not in inputs
-                     and getattr(self.tokenizer, "is_fast", False)
-                     and not sampling_params.add_special_tokens
-                     and sampling_params.truncate_prompt_tokens is None)
-        if use_cache:
-            with nvtx_range_debug("tokenize prompt (prefix cache)"):
-                try:
-                    return cache.encode(self.tokenizer, prompt), None
-                except Exception:
-                    # never fail a request over a cache problem
-                    use_cache = False
-
         with nvtx_range_debug("tokenize prompt"):
             try:
                 token_ids = self.tokenizer.encode(
