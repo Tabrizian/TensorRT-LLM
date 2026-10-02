@@ -104,6 +104,9 @@ struct Params
     int rows;
     int nRanks;
     float* out; // [rows, 2 * nRanks] row-major, rank-major pairs
+    // Self-test only: when non-null the kernel waits with a cycle budget instead of forever and
+    // writes 1 (all peers arrived) or 0 (timed out) here. Never used on the serving path.
+    int* selfTestOk;
 };
 
 //! Launch one CTA. The kernel reads its parity and expected signal count from the window's step

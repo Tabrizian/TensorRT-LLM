@@ -29,6 +29,8 @@ namespace
 {
 
 constexpr int kThreads = 256;
+// ~2 s at 2 GHz: a transport whose peers have not arrived by then is not going to work.
+constexpr long long kSelfTestBudgetCycles = 4000000000ll;
 
 // Rank-major slots [nRanks][kMaxRows][2] -> row-major out [rows][2 * nRanks].
 __device__ __forceinline__ void writeOut(float const* recv, float* out, int rows, int nRanks)
@@ -73,7 +75,30 @@ __global__ void __launch_bounds__(kThreads) ginGatherKernel(Params params)
             ncclGin_WeakSignalInc{0}, ncclGin_None{}, ncclCoopThread{});
     }
     gin.flush(ncclCoopCta{});
-    gin.waitSignal(ncclCoopCta{}, 0, uint64_t(nRanks - 1) * (step + 1));
+    uint64_t const expected = uint64_t(nRanks - 1) * (step + 1);
+    if (params.selfTestOk == nullptr)
+    {
+        gin.waitSignal(ncclCoopCta{}, 0, expected);
+    }
+    else
+    {
+        __shared__ int sOk;
+        if (threadIdx.x == 0)
+        {
+            long long const t0 = clock64();
+            uint64_t seen = gin.readSignal(0);
+            while (seen < expected && clock64() - t0 < kSelfTestBudgetCycles)
+            {
+                seen = gin.readSignal(0);
+            }
+            sOk = seen >= expected ? 1 : 0;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0)
+        {
+            *params.selfTestOk = sOk;
+        }
+    }
     __syncthreads();
 
     writeOut(recv, params.out, params.rows, nRanks);
@@ -105,7 +130,18 @@ __global__ void __launch_bounds__(kThreads) lsaGatherKernel(Params params)
         dst[e] = staging[e];
     }
     ncclLsaBarrierSession<ncclCoopCta> bar{ncclCoopCta{}, params.devComm, ncclTeamTagLsa{}, 0};
-    bar.sync(ncclCoopCta{}, cuda::memory_order_acq_rel);
+    if (params.selfTestOk == nullptr)
+    {
+        bar.sync(ncclCoopCta{}, cuda::memory_order_acq_rel);
+    }
+    else
+    {
+        ncclResult_t const r = bar.sync(ncclCoopCta{}, cuda::memory_order_acq_rel, kSelfTestBudgetCycles);
+        if (threadIdx.x == 0)
+        {
+            *params.selfTestOk = r == ncclSuccess ? 1 : 0;
+        }
+    }
 
     float const* recv = reinterpret_cast<float const*>(ncclGetLocalPointer(params.window, bufOff));
     writeOut(recv, params.out, params.rows, nRanks);

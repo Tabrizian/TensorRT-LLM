@@ -142,6 +142,34 @@ bool tryMode(Runner& runner, dag::Mode mode, int rank, cudaStream_t stream)
         {
             ok = false;
         }
+        if (ok)
+        {
+            // One bounded-wait gather: a device comm can be created and still never deliver (seen
+            // with a proxy GIN whose puts fail on the wire), which would hang the serving loop.
+            int* okDev = nullptr;
+            TLLM_CUDA_CHECK(cudaMalloc(&okDev, sizeof(int)));
+            TLLM_CUDA_CHECK(cudaMemsetAsync(okDev, 0, sizeof(int), stream));
+            float* outDev = nullptr;
+            TLLM_CUDA_CHECK(cudaMalloc(&outDev, size_t(dag::kPairFloats) * runner.nRanks * sizeof(float)));
+            dag::Params params{};
+            params.devComm = devComm;
+            params.window = window.window;
+            params.rows = 1;
+            params.nRanks = runner.nRanks;
+            params.out = outDev;
+            params.selfTestOk = okDev;
+            dag::launchDraftArgmaxGather(params, mode, stream);
+            int okHost = 0;
+            TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
+            TLLM_CUDA_CHECK(cudaMemcpy(&okHost, okDev, sizeof(int), cudaMemcpyDeviceToHost));
+            TLLM_CUDA_CHECK(cudaFree(okDev));
+            TLLM_CUDA_CHECK(cudaFree(outDev));
+            ok = okHost != 0;
+            if (!ok)
+            {
+                TLLM_LOG_WARNING("[draft_argmax_gather] rank %d: mode %d self-test timed out", rank, int(mode));
+            }
+        }
         if (!devCommValid)
         {
             TLLM_LOG_INFO("[draft_argmax_gather] rank %d: ncclDevCommCreate(mode %d) -> %s", rank, int(mode),
