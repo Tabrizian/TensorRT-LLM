@@ -56,6 +56,10 @@ from tensorrt_llm.mapping import Mapping
 from ..distributed.ops import AllReduce, MNNVLAllReduce, allgather
 
 DRAFT_ARGMAX_ALLREDUCE_ENV = "TRTLLM_MTP_DRAFT_ARGMAX_ALLREDUCE"
+# "1": run the exchange over the NCCL device API (GIN puts, or LSA stores when the whole
+# group is one NVLink domain and no GIN backend is configured) instead of the AllReduce SUM.
+# Needs NCCL >= 2.30.5 with symmetric-memory support; falls back to the AllReduce exchange.
+DRAFT_ARGMAX_DEVICE_API_ENV = "TRTLLM_MTP_DRAFT_ARGMAX_DEVICE_API"
 
 # fp32 slots per exchange row: one float4 per lane of a warp. Invariant:
 # 2 * tp_size <= ROW_WIDTH for the widest group the kernels dispatch (64 ranks).
@@ -63,9 +67,16 @@ ROW_WIDTH = 128
 
 # Tag of the exchange's own MNNVL workspace (see the module docstring).
 WORKSPACE_TAG = "draft_argmax"
+# Rows the device-API window holds (kernels/communicationKernels/draftArgmaxGatherKernels.h).
+DEVICE_API_MAX_ROWS = 256
 
 
 @functools.lru_cache(maxsize=1)
+@functools.lru_cache(maxsize=1)
+def draft_argmax_device_api_requested() -> bool:
+    return os.environ.get(DRAFT_ARGMAX_DEVICE_API_ENV, "0").strip() == "1"
+
+
 def draft_argmax_exchange_enabled() -> bool:
     """Process-constant gate: unset / "1" = DraftArgmaxExchange, "0" = original producer."""
     enabled = os.environ.get(DRAFT_ARGMAX_ALLREDUCE_ENV, "1").strip() != "0"
@@ -219,16 +230,31 @@ class DraftArgmaxExchange(nn.Module):
         self._slot = 2 * mapping.tp_rank
         self._idx_offset_factor = mapping.tp_rank  # idx_offset = tp_rank * vocab_per_rank
         self._out_cols = 2 * tp_size
-        self.allreduce = AllReduce(
-            mapping,
-            strategy=strategy,
-            dtype=torch.float32,
-            workspace_tag=WORKSPACE_TAG,
-            # Lamport buffer for the largest exchange forward runs on this path.
-            mnnvl_initial_workspace_bytes=MNNVLAllReduce.get_required_workspace_size(
-                self.max_rows, ROW_WIDTH, tp_size, torch.float32
-            ),
-        )
+        self._group = list(mapping.tp_group)
+        # NCCL device-API gather (trtllm.draft_argmax_gather*): a symmetric window per TP group,
+        # GIN puts + signal or LSA stores + barrier. Init is collective and allocates nothing
+        # through torch, so it is safe under MetaInitMode; 0 means unavailable on some rank.
+        self._device_api_mode = 0
+        if draft_argmax_device_api_requested():
+            self._device_api_mode = int(torch.ops.trtllm.draft_argmax_gather_init(self._group))
+            logger.info(
+                "MTP draft argmax exchange: NCCL device API mode "
+                f"{ {0: 'unavailable (AllReduce fallback)', 1: 'LSA', 2: 'GIN'}.get(self._device_api_mode, '?') }"
+            )
+            self.max_rows = min(self.max_rows, DEVICE_API_MAX_ROWS)
+        self._device_api_staging: Optional[torch.Tensor] = None
+        self.allreduce = None
+        if self._device_api_mode == 0:
+            self.allreduce = AllReduce(
+                mapping,
+                strategy=strategy,
+                dtype=torch.float32,
+                workspace_tag=WORKSPACE_TAG,
+                # Lamport buffer for the largest exchange forward runs on this path.
+                mnnvl_initial_workspace_bytes=MNNVLAllReduce.get_required_workspace_size(
+                    self.max_rows, ROW_WIDTH, tp_size, torch.float32
+                ),
+            )
         # Pack-kernel target, fully overwritten on every exchange. Allocated on
         # the first forward, not here: the worker is built inside the model
         # constructor, which runs under MetaInitMode, and that mode places
@@ -250,6 +276,14 @@ class DraftArgmaxExchange(nn.Module):
         rows = logits.shape[0]
         if not 0 < rows <= self.max_rows:
             return gather_argmax_pairs_allgather(logits, self.mapping)
+        if self._device_api_mode:
+            # [kMaxRows, 2] view over the window's staging region (created on first use: a
+            # from_blob tensor is still a torch allocation under MetaInitMode's rules).
+            if self._device_api_staging is None:
+                self._device_api_staging = torch.ops.trtllm.draft_argmax_gather_staging(self._group)
+            staging = self._device_api_staging
+            local_argmax_pack(logits, self._idx_offset_factor * logits.shape[1], staging[:rows], 0)
+            return torch.ops.trtllm.draft_argmax_gather(staging, rows, self._group)
         staging = self._staging_rows(rows)
         local_argmax_pack(logits, self._idx_offset_factor * logits.shape[1], staging, self._slot)
         return self.allreduce(staging)[:, : self._out_cols]

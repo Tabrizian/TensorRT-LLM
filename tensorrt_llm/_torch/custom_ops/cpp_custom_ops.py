@@ -264,6 +264,14 @@ def _register_fake():
     def _(input, sizes, group, process_group):
         return allgather(input, sizes, group)
 
+    @torch.library.register_fake("trtllm::draft_argmax_gather_staging")
+    def _(group):
+        return torch.empty((256, 2), dtype=torch.float32, device="cuda")
+
+    @torch.library.register_fake("trtllm::draft_argmax_gather")
+    def _(staging, rows, group):
+        return staging.new_empty((rows, 2 * len(group)))
+
     @torch.library.register_fake("trtllm::cublas_scaled_mm")
     def _(
         mat_a: torch.Tensor,

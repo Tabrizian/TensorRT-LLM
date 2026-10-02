@@ -42,6 +42,7 @@ add_library(
   th_common SHARED
   mlaPreprocessOp.cpp
   allgatherOp.cpp
+  draftArgmaxGatherOp.cpp
   allreduceOp.cpp
   alltoallOp.cpp
   asyncUlyssesOp.cpp
