@@ -56,9 +56,10 @@ from tensorrt_llm.mapping import Mapping
 from ..distributed.ops import AllReduce, MNNVLAllReduce, allgather
 
 DRAFT_ARGMAX_ALLREDUCE_ENV = "TRTLLM_MTP_DRAFT_ARGMAX_ALLREDUCE"
-# "1": run the exchange over the NCCL device API (GIN puts, or LSA stores when the whole
-# group is one NVLink domain and no GIN backend is configured) instead of the AllReduce SUM.
-# Needs NCCL >= 2.30.5 with symmetric-memory support; falls back to the AllReduce exchange.
+# Run the exchange over the NCCL device API instead of the AllReduce SUM. "1" / "auto": a GIN
+# device comm where a GIN backend is configured, else LSA stores (every peer in one NVLink
+# domain); "lsa": skip the GIN attempt. Needs NCCL >= 2.30.5 with symmetric-memory support;
+# anything unavailable falls back to the AllReduce exchange.
 DRAFT_ARGMAX_DEVICE_API_ENV = "TRTLLM_MTP_DRAFT_ARGMAX_DEVICE_API"
 
 # fp32 slots per exchange row: one float4 per lane of a warp. Invariant:
@@ -73,8 +74,12 @@ DEVICE_API_MAX_ROWS = 256
 
 @functools.lru_cache(maxsize=1)
 @functools.lru_cache(maxsize=1)
-def draft_argmax_device_api_requested() -> bool:
-    return os.environ.get(DRAFT_ARGMAX_DEVICE_API_ENV, "0").strip() == "1"
+def draft_argmax_device_api_requested() -> str:
+    """ "" (off), "auto" (GIN then LSA) or "lsa" (LSA only)."""
+    value = os.environ.get(DRAFT_ARGMAX_DEVICE_API_ENV, "0").strip().lower()
+    if value in ("1", "auto", "gin"):
+        return "auto"
+    return "lsa" if value == "lsa" else ""
 
 
 def draft_argmax_exchange_enabled() -> bool:
@@ -235,8 +240,11 @@ class DraftArgmaxExchange(nn.Module):
         # GIN puts + signal or LSA stores + barrier. Init is collective and allocates nothing
         # through torch, so it is safe under MetaInitMode; 0 means unavailable on some rank.
         self._device_api_mode = 0
-        if draft_argmax_device_api_requested():
-            self._device_api_mode = int(torch.ops.trtllm.draft_argmax_gather_init(self._group))
+        requested = draft_argmax_device_api_requested()
+        if requested:
+            self._device_api_mode = int(
+                torch.ops.trtllm.draft_argmax_gather_init(self._group, requested == "auto")
+            )
             logger.info(
                 "MTP draft argmax exchange: NCCL device API mode "
                 f"{ {0: 'unavailable (AllReduce fallback)', 1: 'LSA', 2: 'GIN'}.get(self._device_api_mode, '?') }"

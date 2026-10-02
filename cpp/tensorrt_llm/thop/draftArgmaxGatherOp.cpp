@@ -202,7 +202,7 @@ bool tryMode(Runner& runner, dag::Mode mode, int rank, cudaStream_t stream)
 
 // Collective over the group: every rank must call it. The mode is identical on every rank because
 // each decision is reduced with ncclAllReduce(min).
-std::shared_ptr<Runner> getOrCreateRunner(std::set<int> const& group)
+std::shared_ptr<Runner> getOrCreateRunner(std::set<int> const& group, bool allowGin)
 {
     auto comm = getComm(group);
     TLLM_CHECK_WITH_INFO(comm && *comm, "draft argmax gather: no NCCL communicator for the group");
@@ -223,7 +223,7 @@ std::shared_ptr<Runner> getOrCreateRunner(std::set<int> const& group)
     ncclCommProperties_t props = NCCL_COMM_PROPERTIES_INITIALIZER;
     bool const supported = ncclCommQueryProperties(*comm, &props) == ncclSuccess && props.deviceApiSupport
         && tensorrt_llm::common::nccl_util::isNcclWindowSupported();
-    int const hasGin = supported && props.ginType != NCCL_GIN_TYPE_NONE ? 1 : 0;
+    int const hasGin = supported && allowGin && props.ginType != NCCL_GIN_TYPE_NONE ? 1 : 0;
     TLLM_LOG_INFO("[draft_argmax_gather] rank %d/%d: deviceApi=%d ginType=%d nLsaTeams=%d windows=%d", props.rank,
         props.nRanks, int(props.deviceApiSupport), int(props.ginType), props.nLsaTeams, int(supported));
 
@@ -277,9 +277,9 @@ std::shared_ptr<Runner> findRunner(std::set<int> const& group)
 
 } // namespace
 
-int64_t draft_argmax_gather_init(torch::List<int64_t> group_)
+int64_t draft_argmax_gather_init(torch::List<int64_t> group_, bool allow_gin)
 {
-    auto runner = getOrCreateRunner(toGroup(group_));
+    auto runner = getOrCreateRunner(toGroup(group_), allow_gin);
     return static_cast<int64_t>(runner->mode);
 }
 
@@ -314,7 +314,7 @@ torch::Tensor draft_argmax_gather(torch::Tensor staging, int64_t rows, torch::Li
 
 #else  // !TLLM_DRAFT_ARGMAX_GATHER_DEVICE_API
 
-int64_t draft_argmax_gather_init(torch::List<int64_t>)
+int64_t draft_argmax_gather_init(torch::List<int64_t>, bool)
 {
     return 0;
 }
@@ -337,18 +337,19 @@ TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.def("draft_argmax_gather_init(int[] group) -> int");
+    m.def("draft_argmax_gather_init(int[] group, bool allow_gin) -> int");
     m.def("draft_argmax_gather_staging(int[] group) -> Tensor");
     m.def("draft_argmax_gather(Tensor staging, int rows, int[] group) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("draft_argmax_gather_staging", &tensorrt_llm::torch_ext::draft_argmax_gather_staging);
     m.impl("draft_argmax_gather", &tensorrt_llm::torch_ext::draft_argmax_gather);
 }
 
+// No tensor arguments -> no dispatch key to infer from; register as composite so the call resolves.
 TORCH_LIBRARY_IMPL(trtllm, CompositeExplicitAutograd, m)
 {
     m.impl("draft_argmax_gather_init", &tensorrt_llm::torch_ext::draft_argmax_gather_init);
+    m.impl("draft_argmax_gather_staging", &tensorrt_llm::torch_ext::draft_argmax_gather_staging);
 }
