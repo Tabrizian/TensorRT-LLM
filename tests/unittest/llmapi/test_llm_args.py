@@ -92,6 +92,20 @@ def test_LookaheadDecodingConfig():
     assert pybind_config.max_verification_set_size == 4
 
 
+@pytest.mark.cpu_only
+def test_iter_perf_stats_interval_defaults_and_validation() -> None:
+    assert TorchLlmArgs(model=llama_model_path).iter_perf_stats_interval == 1
+    args = TorchLlmArgs(model=llama_model_path,
+                        enable_iter_perf_stats=True,
+                        iter_perf_stats_interval=16)
+    assert args.iter_perf_stats_interval == 16
+
+    for invalid in (0, -1):
+        with pytest.raises(ValidationError, match="iter_perf_stats_interval"):
+            TorchLlmArgs(model=llama_model_path,
+                         iter_perf_stats_interval=invalid)
+
+
 def test_MTPDecodingConfig_default_draft_len_is_not_user_set():
     config = MTPDecodingConfig()
 

@@ -539,6 +539,13 @@
     },
     {
       "allowed_values": [],
+      "annotation": "Annotated[int, Gt(gt=0)]",
+      "converter": "",
+      "kind": "value",
+      "path": "iter_perf_stats_interval"
+    },
+    {
+      "allowed_values": [],
       "annotation": "Optional[int]",
       "converter": "",
       "kind": "value",
