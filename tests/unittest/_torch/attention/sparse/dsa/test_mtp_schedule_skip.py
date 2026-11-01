@@ -41,8 +41,13 @@ pytestmark = [
 ]
 
 
-def _make_decode_metadata() -> DSAtrtllmAttentionMetadata:
-    """A prepared one-token-per-request generation batch, as draft steps >= 1 see it."""
+@pytest.fixture
+def decode_metadata():
+    """A prepared one-token-per-request generation batch, as draft steps >= 1 see it.
+
+    The cache manager is shut down on teardown: it owns CUDA reservations that a
+    garbage-collector free would release on a thread without a current CUDA context.
+    """
     batch_size = len(KV_LENS)
     sparse_config = DeepSeekSparseAttentionConfig(
         index_n_heads=32,
@@ -68,37 +73,40 @@ def _make_decode_metadata() -> DSAtrtllmAttentionMetadata:
         dtype=DataType.HALF,
         sparse_attention_config=sparse_config,
     )
-    request_ids = list(range(batch_size))
-    kv_cache_manager.add_dummy_requests(
-        request_ids=request_ids, token_nums=KV_LENS, is_gen=False, prepare_resource=True
-    )
-    cached = [kv_len - 1 for kv_len in KV_LENS]
-    metadata = DSAtrtllmAttentionMetadata(
-        seq_lens=torch.ones(batch_size, dtype=torch.int),
-        request_ids=request_ids,
-        max_num_requests=batch_size,
-        num_contexts=0,
-        prompt_lens=cached,
-        max_num_tokens=batch_size * (1 + MAX_DRAFT_TOKENS),
-        kv_cache_manager=kv_cache_manager,
-        kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=cached),
-        mapping=mapping,
-        sparse_metadata_params=sparse_config.to_sparse_metadata_params(),
-    )
-    # The draft depth is set the way the engine sets it; this also sizes the
-    # next_n-dependent buffers. Spec-dec attention stays off, as in draft steps >= 1.
-    metadata.update_spec_dec_param(
-        batch_size=batch_size,
-        is_spec_decoding_enabled=False,
-        is_spec_dec_tree=False,
-        is_spec_dec_dynamic_tree=False,
-        max_draft_len=MAX_DRAFT_TOKENS,
-        max_total_draft_tokens=MAX_DRAFT_TOKENS,
-    )
-    metadata.prepare()
-    torch.cuda.synchronize()
-    assert metadata.sparse_metadata_params.mtp_index_share
-    return metadata
+    try:
+        request_ids = list(range(batch_size))
+        kv_cache_manager.add_dummy_requests(
+            request_ids=request_ids, token_nums=KV_LENS, is_gen=False, prepare_resource=True
+        )
+        cached = [kv_len - 1 for kv_len in KV_LENS]
+        metadata = DSAtrtllmAttentionMetadata(
+            seq_lens=torch.ones(batch_size, dtype=torch.int),
+            request_ids=request_ids,
+            max_num_requests=batch_size,
+            num_contexts=0,
+            prompt_lens=cached,
+            max_num_tokens=batch_size * (1 + MAX_DRAFT_TOKENS),
+            kv_cache_manager=kv_cache_manager,
+            kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=cached),
+            mapping=mapping,
+            sparse_metadata_params=sparse_config.to_sparse_metadata_params(),
+        )
+        # The draft depth is set the way the engine sets it; this also sizes the
+        # next_n-dependent buffers. Spec-dec attention stays off, as in draft steps >= 1.
+        metadata.update_spec_dec_param(
+            batch_size=batch_size,
+            is_spec_decoding_enabled=False,
+            is_spec_dec_tree=False,
+            is_spec_dec_dynamic_tree=False,
+            max_draft_len=MAX_DRAFT_TOKENS,
+            max_total_draft_tokens=MAX_DRAFT_TOKENS,
+        )
+        metadata.prepare()
+        torch.cuda.synchronize()
+        assert metadata.sparse_metadata_params.mtp_index_share
+        yield metadata
+    finally:
+        kv_cache_manager.shutdown()
 
 
 def _schedule_buffers(metadata):
@@ -120,23 +128,51 @@ def _is_poisoned(metadata):
     return [bool((buf == -1).all()) for buf in _schedule_buffers(metadata)]
 
 
-def test_schedule_is_skipped_only_inside_the_draft_loop():
-    metadata = _make_decode_metadata()
+def _kv_lens_buffers(metadata):
+    """What on_update_kv_lens() refreshes from the KV lengths even when it skips the schedule."""
+    num_tokens = metadata.num_tokens
+    num_generations = metadata.num_generations
+    return [
+        metadata.slot_mapping_fp8[:num_tokens],
+        metadata.slot_mapping_scale[:num_tokens],
+        metadata.gen_kv_indptr[1 : num_generations + 1],
+        metadata.gen_cached_token_indptr[1 : num_generations + 1],
+    ]
+
+
+def _snapshot(buffers):
+    torch.cuda.synchronize()
+    return [buf.clone() for buf in buffers]
+
+
+def test_schedule_is_skipped_only_inside_the_draft_loop(decode_metadata):
+    metadata = decode_metadata
 
     # Outside the draft loop: full rebuild.
     _poison(metadata)
     metadata.update_for_spec_dec()
     assert not metadata.indexer_schedule_stale
     assert _is_poisoned(metadata) == [False, False, False]
+    before_advance = _snapshot(_kv_lens_buffers(metadata))
 
-    # Inside the index-sharing draft loop: schedule left as is and marked stale.
+    # Inside the index-sharing draft loop, after a draft step appends a token: the schedule
+    # is left as is and marked stale, but the KV-lens-dependent buffers are still rewritten.
     metadata.set_in_mtp_draft_loop(True)
+    metadata.kv_lens_cuda[: metadata.num_generations] += 1
     _poison(metadata)
+    for buf in _kv_lens_buffers(metadata):
+        buf.fill_(-1)
     metadata.update_for_spec_dec()
     assert metadata.indexer_schedule_stale
     assert _is_poisoned(metadata) == [True, True, True]
+    in_draft_loop = _snapshot(_kv_lens_buffers(metadata))
 
-    # The next full rebuild (target forward) restores it and clears the marker.
+    # The next full rebuild (target forward) restores the schedule, clears the marker and
+    # writes the same slot mappings and gen indptrs, which follow the advanced lengths.
     metadata.on_update_kv_lens()
     assert not metadata.indexer_schedule_stale
     assert _is_poisoned(metadata) == [False, False, False]
+    full_rebuild = _snapshot(_kv_lens_buffers(metadata))
+    for skipped, rebuilt, stale in zip(in_draft_loop, full_rebuild, before_advance):
+        assert torch.equal(skipped, rebuilt)
+        assert not torch.equal(skipped, stale)

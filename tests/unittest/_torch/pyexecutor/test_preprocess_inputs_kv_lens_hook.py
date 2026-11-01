@@ -14,6 +14,8 @@ import torch
 
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import DecoderInputPreparer
 
+pytestmark = pytest.mark.cpu_only
+
 KV_LENS = torch.tensor([10, 20, 30], dtype=torch.int32)
 KV_LENS_OFFSETS = torch.tensor([1, 2, 0], dtype=torch.int32)
 TOKENS_PER_REQUEST = 3
